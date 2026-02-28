@@ -60,6 +60,11 @@ async def injetar_codigo_de_rastreio_na_shopify_assincrono(id_interno_pedido: st
         resposta_atualizacao = await cliente_http_assincrono.post(url_atualizacao, json=corpo_da_requisicao, headers=cabecalhos_requisicao)
         return resposta_atualizacao.status_code in [200, 201]
 
+@app_servidor_web.get("/")
+async def rota_raiz():
+    """Rota raiz para o Melhor Envio validar o domínio principal (Site da plataforma)."""
+    return {"status": "sucesso", "mensagem": "Servidor da YK SoftwareHouse operante e aguardando eventos!"}
+
 @app_servidor_web.get("/webhook/melhor-envio/atualizacao")
 async def responder_ping_validacao_melhor_envio():
     """Rota GET exclusiva para responder ao ping de teste do Melhor Envio."""
@@ -69,13 +74,12 @@ async def responder_ping_validacao_melhor_envio():
 async def processar_evento_de_rastreio(dados_do_webhook: DadosWebhookMelhorEnvio):
     """Rota POST que recebe as atualizações reais de pacotes."""
     
-    # 1. Validação inicial do Melhor Envio
     if dados_do_webhook.status is None or not dados_do_webhook.id:
-        return {"status": "sucesso", "mensagem": "Ping de teste validado!"}
+        return {"status": "sucesso", "mensagem": "Ping de teste vazio validado!"}
 
     status_que_importam = ["released", "posted"]
     if dados_do_webhook.status not in status_que_importam:
-        return {"mensagem": f"Status '{dados_do_webhook.status}' ignorado."}
+        return {"status": "ignorado", "mensagem": f"Status '{dados_do_webhook.status}' ignorado."}
 
     cabecalhos_melhor_envio = {"Authorization": f"Bearer {TOKEN_API_MELHOR_ENVIO}", "Accept": "application/json"}
     url_detalhes_frete = f"https://www.melhorenvio.com.br/api/v2/me/orders/{dados_do_webhook.id}"
@@ -84,8 +88,7 @@ async def processar_evento_de_rastreio(dados_do_webhook: DadosWebhookMelhorEnvio
         resposta_frete = await cliente_http_assincrono.get(url_detalhes_frete, headers=cabecalhos_melhor_envio)
         
     if resposta_frete.status_code != 200:
-        mensagem_erro_api_melhor_envio = resposta_frete.text
-        raise HTTPException(status_code=500, detail=f"Erro no Melhor Envio (Status {resposta_frete.status_code}): {mensagem_erro_api_melhor_envio}")
+        return {"status": "erro_ignorado", "mensagem": f"Erro no Melhor Envio: {resposta_frete.text}"}
     
     dados_completos_etiqueta = resposta_frete.json()
     nome_da_transportadora = dados_completos_etiqueta.get("service", {}).get("company", {}).get("name", "Correios")
@@ -94,16 +97,16 @@ async def processar_evento_de_rastreio(dados_do_webhook: DadosWebhookMelhorEnvio
     numero_do_pedido = tags_do_pedido[0].get("tag") if tags_do_pedido else dados_completos_etiqueta.get("non_commercial", {}).get("content")
 
     if not numero_do_pedido:
-        return {"erro": "Número do pedido não encontrado na etiqueta."}
+        return {"status": "ignorado", "erro": "Número do pedido não encontrado na etiqueta."}
 
     id_interno_do_pedido = await buscar_id_interno_shopify_por_numero_assincrono(numero_do_pedido, TOKEN_SHOPIFY, NOME_DA_LOJA_SHOPIFY)
     
     if not id_interno_do_pedido:
-        raise HTTPException(status_code=404, detail="Pedido não encontrado na Shopify")
+        return {"status": "ignorado", "mensagem": "Pedido não encontrado na Shopify. (Pode ser o disparo de teste do M.E.)"}
 
     sucesso_na_injecao = await injetar_codigo_de_rastreio_na_shopify_assincrono(id_interno_do_pedido, dados_do_webhook.tracking, nome_da_transportadora, TOKEN_SHOPIFY, NOME_DA_LOJA_SHOPIFY)
     
     if sucesso_na_injecao:
         return {"status": "sucesso", "pedido": numero_do_pedido}
     
-    raise HTTPException(status_code=500, detail="Erro ao atualizar Shopify")
+    return {"status": "erro_ignorado", "mensagem": "Falha ao injetar rastreio na Shopify."}
