@@ -1,0 +1,9 @@
+venv/
+env/
+
+# Variáveis de Ambiente (Tokens e Senhas)
+.env
+
+# Cache do Python
+__pycache__/
+*.pyc
