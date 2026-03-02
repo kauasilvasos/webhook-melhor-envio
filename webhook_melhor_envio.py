@@ -655,3 +655,34 @@ async def expor_contrato_de_rastreio_para_frontend(numero_do_pedido_cliente: str
 
     logger_telemetria.info(f"--- [FIM] Fluxo de rastreio finalizado com sucesso para: {numero_do_pedido_cliente} ---")
     return contrato_dados_frontend
+
+@app_servidor_web.get("/auth/callback")
+async def capturar_token_oauth(shop: str, code: str):
+    """Rota temporária para capturar o token shpat_ via OAuth da Shopify 2026"""
+    client_id = os.getenv("SHOPIFY_CLIENT_ID")
+    client_secret = os.getenv("SHOPIFY_CLIENT_SECRET")
+    
+    if not client_id or not client_secret:
+        return {"erro": "Faltam as chaves SHOPIFY_CLIENT_ID ou SHOPIFY_CLIENT_SECRET no Render"}
+
+    url_troca = f"https://{shop}/admin/oauth/access_token"
+    payload = {
+        "client_id": client_id,
+        "client_secret": client_secret,
+        "code": code
+    }
+    
+    async with httpx.AsyncClient() as client:
+        resposta = await client.post(url_troca, json=payload)
+        dados = resposta.json()
+        
+        token = dados.get("access_token")
+        
+        if token:
+            logger_telemetria.info("=" * 60)
+            logger_telemetria.info(f"🔑 TOKEN CAPTURADO COM SUCESSO: {token}")
+            logger_telemetria.info("=" * 60)
+            return {"status": "sucesso", "mensagem": "Vá olhar os logs do Render agora! O token shpat_ está lá."}
+        else:
+            logger_telemetria.error(f"Erro ao capturar token: {dados}")
+            return {"status": "erro", "detalhes": dados}
