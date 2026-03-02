@@ -255,8 +255,6 @@ async def alternar_status_separacao(kit_id: str):
 # 4. TELA DE ADMIN COM CHECKLIST
 @app_servidor_web.get("/admin/vendas", response_class=HTMLResponse)
 async def painel_admin_vendas():
-    pedido_gratis = v.get("pedido_gratuito", False)
-    total = v.get("total_price", 0)
     html_content = """
     <html>
         <head>
@@ -293,6 +291,8 @@ async def painel_admin_vendas():
     """
     
     for v in reversed(DB_VENDAS_KITS):
+        pedido_gratis = v.get("pedido_gratuito", False)
+        total = v.get("total_price", 0)
         status_css = "separado" if v.get("ja_foi_separado") else ""
         check_attr = "checked" if v.get("ja_foi_separado") else ""
         enviado_css = "enviado" if v.get("enviado") else ""
