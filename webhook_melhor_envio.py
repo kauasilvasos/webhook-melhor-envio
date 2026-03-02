@@ -1,4 +1,3 @@
-# webhook_melhor_envio.py
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 from typing import Optional, Dict, Any
@@ -7,12 +6,81 @@ import os
 from dotenv import load_dotenv
 from fastapi.middleware.cors import CORSMiddleware
 from datetime import datetime, timedelta
+from fastapi.responses import HTMLResponse
+from typing import List
 
 load_dotenv()
-
+DB_VENDAS_KITS = []
 app_servidor_web = FastAPI()
 
 ALLOWED_ORIGINS = os.getenv("CORS_ALLOW_ORIGINS", "*").split(",")  
+
+class ItemKit(BaseModel):
+    unidade: str
+    tamanho: str
+    cor: str
+
+class VendaPayload(BaseModel):
+    kit_id: str
+    nome_produto: str
+    quantidade_itens: int
+    detalhes: List[ItemKit]
+    data_hora: str
+
+@app_servidor_web.post("/Venda")
+async def registrar_venda_kit(payload: VendaPayload):
+    """
+    Recebe os dados do carrinho do frontend da Shopify antes de ir para a Yampi.
+    """
+    DB_VENDAS_KITS.append(payload.dict())
+    return {"status": "sucesso", "mensagem": "Kit salvo na base de dados paralela", "kit_id": payload.kit_id}
+
+@app_servidor_web.get("/admin/vendas", response_class=HTMLResponse)
+async def painel_admin_vendas():
+    html_content = """
+    <html>
+        <head>
+            <title>Admin - Separação de Kits</title>
+            <style>
+                body { font-family: Arial, sans-serif; background-color: #f4f4f9; padding: 20px; }
+                h1 { color: #333; text-align: center; }
+                table { width: 100%; border-collapse: collapse; background: #fff; box-shadow: 0 2px 5px rgba(0,0,0,0.1); border-radius: 8px; overflow: hidden; }
+                th, td { padding: 15px; text-align: left; border-bottom: 1px solid #ddd; }
+                th { background-color: #000; color: #fff; text-transform: uppercase; font-size: 14px; }
+                tr:hover { background-color: #f1f1f1; }
+                .badge { background: #2b589c; color: white; padding: 4px 8px; border-radius: 4px; font-weight: bold; font-size: 12px; }
+                .roupas-list { margin: 0; padding-left: 15px; }
+            </style>
+        </head>
+        <body>
+            <h1>📦 Painel de Separação de Kits</h1>
+            <table>
+                <tr>
+                    <th>Data/Hora</th>
+                    <th>ID do Kit (Ponte Yampi)</th>
+                    <th>Produto</th>
+                    <th>Detalhes para Separação</th>
+                </tr>
+    """
+    
+    for venda in reversed(DB_VENDAS_KITS):
+        linhas_roupas = "".join([f"<li><b>{item['unidade']}</b>: Tamanho {item['tamanho']} | Cor {item['cor']}</li>" for item in venda['detalhes']])
+        
+        html_content += f"""
+                <tr>
+                    <td>{venda['data_hora']}</td>
+                    <td><span class="badge">{venda['kit_id']}</span></td>
+                    <td>{venda['nome_produto']} ({venda['quantidade_itens']} peças)</td>
+                    <td><ul class="roupas-list">{linhas_roupas}</ul></td>
+                </tr>
+        """
+        
+    html_content += """
+            </table>
+        </body>
+    </html>
+    """
+    return HTMLResponse(content=html_content)
 
 app_servidor_web.add_middleware(
     CORSMiddleware,
