@@ -8,7 +8,17 @@ from fastapi.middleware.cors import CORSMiddleware
 from datetime import datetime, timedelta
 from fastapi.responses import HTMLResponse
 from typing import List
+from urllib.parse import urlparse, parse_qs
 
+def extrair_utm_campaign(url: Optional[str]) -> Optional[str]:
+    if not url:
+        return None
+    try:
+        qs = parse_qs(urlparse(url).query)
+        v = qs.get("utm_campaign", [None])[0]
+        return v
+    except Exception:
+        return None
 load_dotenv()
 DB_VENDAS_KITS = []
 app_servidor_web = FastAPI()
@@ -27,60 +37,186 @@ class VendaPayload(BaseModel):
     detalhes: List[ItemKit]
     data_hora: str
 
+@app_servidor_web.post("/webhook-shopify/pedido-criado")
+async def webhook_shopify_pedido_criado(data: Dict[str, Any]):
+    # Shopify manda o pedido inteiro
+    numero = data.get("name")  # "#1234"
+    order_id = data.get("id")
+    customer = data.get("customer") or {}
+    email = data.get("email") or customer.get("email")
+    nome = None
+    if customer:
+        nome = (customer.get("first_name") or "") + " " + (customer.get("last_name") or "")
+        nome = nome.strip() or customer.get("name")
+
+    # Onde normalmente fica a URL com utms
+    landing_site = data.get("landing_site") or ""
+    kit_id = extrair_utm_campaign(landing_site)
+
+    if not kit_id:
+        return {"status": "ignorado", "motivo": "sem utm_campaign no landing_site"}
+
+    for venda in DB_VENDAS_KITS:
+        if venda.get("kit_id") == kit_id:
+            venda["status_pedido"] = "PEDIDO_CRIADO"
+            venda["numero_pedido_shopify"] = numero
+            venda["id_pedido_shopify"] = str(order_id) if order_id else None
+            if email:
+                venda["email_cliente"] = email
+            if nome and (venda.get("nome_cliente") in [None, "", "Aguardando Pagamento..."]):
+                venda["nome_cliente"] = nome
+            return {"status": "ok", "kit_id": kit_id, "pedido": numero}
+
+    return {"status": "nao_encontrado", "kit_id": kit_id}
+
+
+@app_servidor_web.post("/webhook-shopify/pedido-pago")
+async def webhook_shopify_pedido_pago(data: Dict[str, Any]):
+    numero = data.get("name")  # "#1234"
+    order_id = data.get("id")
+    landing_site = data.get("landing_site") or ""
+    kit_id = extrair_utm_campaign(landing_site)
+
+    for venda in DB_VENDAS_KITS:
+        if (kit_id and venda.get("kit_id") == kit_id) or (numero and venda.get("numero_pedido_shopify") == numero) or (order_id and str(order_id) == str(venda.get("id_pedido_shopify"))):
+            venda["status_pedido"] = "PEDIDO_APROVADO"
+            venda["status_pagamento"] = "PAGO"
+            return {"status": "ok", "pedido": numero}
+
+    return {"status": "nao_encontrado", "pedido": numero}
+
 @app_servidor_web.post("/Venda")
 async def registrar_venda_kit(payload: VendaPayload):
-    """
-    Recebe os dados do carrinho do frontend da Shopify antes de ir para a Yampi.
-    """
-    DB_VENDAS_KITS.append(payload.dict())
-    return {"status": "sucesso", "mensagem": "Kit salvo na base de dados paralela", "kit_id": payload.kit_id}
+    nova_venda = payload.dict()
+    nova_venda["ja_foi_separado"] = False
+    nova_venda["nome_cliente"] = "Aguardando Pagamento..."
+    nova_venda["status_pedido"] = "AGUARDANDO_PEDIDO_SHOPIFY"
+    nova_venda["numero_pedido_shopify"] = None
+    nova_venda["id_pedido_shopify"] = None
+    nova_venda["status_pagamento"] = "PENDENTE"
+    nova_venda["email_cliente"] = None
+    nova_venda["enviado"] = False
 
+    DB_VENDAS_KITS.append(nova_venda)
+    return {"status": "sucesso", "kit_id": payload.kit_id}
+
+# 2. WEBHOOK DA YAMPI (PARA ATUALIZAR O NOME DO CLIENTE QUANDO PAGAR)
+@app_servidor_web.post("/webhook-yampi")
+async def webhook_yampi(data: Dict[str, Any]):
+    cart_data = data.get("resource", {})
+    customer_data = cart_data.get("customer", {})
+    nome_real = customer_data.get("name", "Cliente Yampi")
+    email_real = customer_data.get("email")
+
+    
+    # Busca o ID do Kit nas UTMs enviadas pela Yampi
+    utm_campaign = cart_data.get("utm_campaign") or cart_data.get("tracking", {}).get("utm_campaign")
+    
+    if utm_campaign:
+        for venda in DB_VENDAS_KITS:
+            if venda["kit_id"] == utm_campaign:
+                venda["nome_cliente"] = nome_real
+                if email_real:
+                    venda["email_cliente"] = email_real
+                venda["status_pagamento"] = "PAGO"
+                break
+                
+    return {"status": "recebido"}
+
+@app_servidor_web.post("/admin/vendas/alternar-enviado/{kit_id}")
+async def alternar_status_enviado(kit_id: str):
+    for venda in DB_VENDAS_KITS:
+        if venda["kit_id"] == kit_id:
+            venda["enviado"] = not venda.get("enviado", False)
+            return {"sucesso": True, "novo_status": venda["enviado"]}
+    raise HTTPException(status_code=404, detail="Kit não encontrado")
+
+@app_servidor_web.post("/admin/vendas/alternar-status/{kit_id}")
+async def alternar_status_separacao(kit_id: str):
+    for venda in DB_VENDAS_KITS:
+        if venda["kit_id"] == kit_id:
+            venda["ja_foi_separado"] = not venda.get("ja_foi_separado", False)
+            return {"sucesso": True, "novo_status": venda["ja_foi_separado"]}
+    raise HTTPException(status_code=404, detail="Kit não encontrado")
+
+# 4. TELA DE ADMIN COM CHECKLIST
 @app_servidor_web.get("/admin/vendas", response_class=HTMLResponse)
 async def painel_admin_vendas():
     html_content = """
     <html>
         <head>
-            <title>Admin - Separação de Kits</title>
+            <title>Painel de Separação</title>
             <style>
-                body { font-family: Arial, sans-serif; background-color: #f4f4f9; padding: 20px; }
-                h1 { color: #333; text-align: center; }
-                table { width: 100%; border-collapse: collapse; background: #fff; box-shadow: 0 2px 5px rgba(0,0,0,0.1); border-radius: 8px; overflow: hidden; }
-                th, td { padding: 15px; text-align: left; border-bottom: 1px solid #ddd; }
-                th { background-color: #000; color: #fff; text-transform: uppercase; font-size: 14px; }
-                tr:hover { background-color: #f1f1f1; }
-                .badge { background: #2b589c; color: white; padding: 4px 8px; border-radius: 4px; font-weight: bold; font-size: 12px; }
-                .roupas-list { margin: 0; padding-left: 15px; }
+                body { font-family: 'Segoe UI', sans-serif; background: #f0f2f5; padding: 30px; }
+                .card { background: white; border-radius: 12px; box-shadow: 0 4px 15px rgba(0,0,0,0.1); padding: 20px; margin-bottom: 20px; border-left: 8px solid #2b589c; transition: 0.3s; }
+                .separado { border-left-color: #28a745; opacity: 0.6; background: #f8fff9; }
+                .separado h3 { text-decoration: line-through; }
+                .header { display: flex; justify-content: space-between; align-items: center; }
+                .detalhes { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 10px; margin-top: 15px; background: #f9f9f9; padding: 10px; border-radius: 8px; }
+                .item-badge { background: #eee; padding: 5px 10px; border-radius: 4px; font-size: 0.9em; }
+                .checkbox-custom { width: 25px; height: 25px; cursor: pointer; }
             </style>
+            <script>
+                async function marcar(kitId) {
+                    const res = await fetch('/admin/vendas/alternar-status/' + kitId, {method: 'POST'});
+                    const data = await res.json();
+                    if(data.sucesso) {
+                    document.getElementById('card-' + kitId).classList.toggle('separado');
+                    }
+                }
+                async function marcarEnviado(kitId) {
+                    const res = await fetch('/admin/vendas/alternar-enviado/' + kitId, {method: 'POST'});
+                    const data = await res.json();
+                    if(data.sucesso) {
+                    document.getElementById('card-' + kitId).classList.toggle('enviado');
+                    }
+                }
+                </script>
         </head>
         <body>
-            <h1>📦 Painel de Separação de Kits</h1>
-            <table>
-                <tr>
-                    <th>Data/Hora</th>
-                    <th>ID do Kit (Ponte Yampi)</th>
-                    <th>Produto</th>
-                    <th>Detalhes para Separação</th>
-                </tr>
+            <h1>📋 Fila de Separação de Kits</h1>
     """
     
-    for venda in reversed(DB_VENDAS_KITS):
-        linhas_roupas = "".join([f"<li><b>{item['unidade']}</b>: Tamanho {item['tamanho']} | Cor {item['cor']}</li>" for item in venda['detalhes']])
+    for v in reversed(DB_VENDAS_KITS):
+        status_css = "separado" if v.get("ja_foi_separado") else ""
+        check_attr = "checked" if v.get("ja_foi_separado") else ""
+        enviado_css = "enviado" if v.get("enviado") else ""
+        check_enviado = "checked" if v.get("enviado") else ""
+        status_pedido = v.get("status_pedido", "—")
+        status_pagamento = v.get("status_pagamento", "—")
+        pedido_num = v.get("numero_pedido_shopify", "—")
+        email_cli = v.get("email_cliente", "—")
+        detalhes_html = "".join([f"<div class='item-badge'><b>{i['unidade']}:</b> {i['tamanho']} - {i['cor']}</div>" for i in v['detalhes']])
         
         html_content += f"""
-                <tr>
-                    <td>{venda['data_hora']}</td>
-                    <td><span class="badge">{venda['kit_id']}</span></td>
-                    <td>{venda['nome_produto']} ({venda['quantidade_itens']} peças)</td>
-                    <td><ul class="roupas-list">{linhas_roupas}</ul></td>
-                </tr>
-        """
-        
-    html_content += """
-            </table>
-        </body>
-    </html>
-    """
-    return HTMLResponse(content=html_content)
+            <div class="card {status_css} {enviado_css}" id="card-{v['kit_id']}">
+                <div class="header">
+                <div>
+                    <small>
+                    {v.get('data_hora','—')} | ID: {v['kit_id']} | Pedido: {pedido_num}
+                    </small>
+
+                    <div style="margin-top:6px; font-size:14px;">
+                    <b>Status pedido:</b> {status_pedido} &nbsp; | &nbsp;
+                    <b>Pagamento:</b> {status_pagamento} &nbsp; | &nbsp;
+                    <b>Email:</b> {email_cli}
+                    </div>
+
+                    <div style="margin-top:10px;">
+                    <label style="margin-left:12px;">Enviado</label>
+                    <input type="checkbox" class="checkbox-custom" {check_enviado} onclick="marcarEnviado('{v['kit_id']}')">
+                    </div>
+                </div>
+                </div>
+
+                <div class="detalhes">
+                {detalhes_html}
+                </div>
+            </div>
+            """
+    
+    html_content += "</body></html>"
+    return html_content
 
 app_servidor_web.add_middleware(
     CORSMiddleware,
