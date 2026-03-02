@@ -718,3 +718,85 @@ async def capturar_token_oauth(shop: str, code: str):
         else:
             logger_telemetria.error(f"Erro ao capturar token: {dados}")
             return {"status": "erro", "detalhes": dados}
+
+
+@app_servidor_web.get("/admin/sincronizar-historico")
+async def retroalimentar_banco_de_dados_supabase():
+    """Rota temporária para popular o banco de dados com etiquetas antigas do Melhor Envio."""
+    if not cliente_banco_supabase:
+        return {"erro": "Conexão com Supabase não estabelecida. Verifique as chaves no Render."}
+
+    logger_telemetria.info("Iniciando varredura retroativa no Melhor Envio...")
+
+    # Passo 1: Buscar as últimas 50 etiquetas geradas (que já foram postadas ou entregues)
+    url_listar_pedidos_antigos = "https://www.melhorenvio.com.br/api/v2/me/orders?status=released,posted,delivered&limit=50"
+    cabecalhos_acesso = {
+        "Authorization": f"Bearer {TOKEN_API_MELHOR_ENVIO}",
+        "Accept": "application/json",
+        "User-Agent": "IntegracaoYkSoftwareHouse/1.0"
+    }
+
+    async with httpx.AsyncClient(timeout=30.0) as cliente_http:
+        resposta_listagem = await cliente_http.get(url_listar_pedidos_antigos, headers=cabecalhos_acesso)
+
+    if resposta_listagem.status_code != 200:
+        return {"erro": "Falha ao listar pedidos antigos", "detalhes": resposta_listagem.text}
+
+    # A API do ME geralmente retorna a lista dentro de um dicionário chamado 'data'
+    dados_resposta = resposta_listagem.json()
+    matriz_de_etiquetas_antigas = dados_resposta.get("data", []) if isinstance(dados_resposta, dict) else dados_resposta
+
+    # Extrai apenas os códigos UUID (36 caracteres)
+    lista_de_ids_secretos = [etiqueta.get("id") for etiqueta in matriz_de_etiquetas_antigas if etiqueta.get("id")]
+
+    if not lista_de_ids_secretos:
+        return {"mensagem": "Nenhuma etiqueta antiga encontrada para sincronizar."}
+
+    logger_telemetria.info(f"Encontradas {len(lista_de_ids_secretos)} etiquetas. Buscando histórico logístico em lote...")
+
+    # Passo 2: Usar a nossa função de lote para pegar os eventos de todos de uma vez
+    dicionario_eventos_historicos = await buscar_eventos_de_rastreio_em_lote_no_melhor_envio(lista_de_ids_secretos)
+    
+    quantidade_salva_no_banco = 0
+
+    # Passo 3: Cruzar as informações e salvar no Supabase
+    for id_etiqueta_36_chars, info_rastreio in dicionario_eventos_historicos.items():
+        # Acha a etiqueta original na lista para descobrirmos o numero do pedido (tag)
+        etiqueta_original = next((e for e in matriz_de_etiquetas_antigas if e.get("id") == id_etiqueta_36_chars), {})
+        
+        # Tenta achar o número do pedido (ex: #1554)
+        lista_de_tags = etiqueta_original.get("tags", [])
+        numero_pedido_vinculado = None
+        
+        if lista_de_tags:
+            primeira_tag = lista_de_tags[0]
+            numero_pedido_vinculado = primeira_tag.get("tag") if isinstance(primeira_tag, dict) else primeira_tag
+        
+        if not numero_pedido_vinculado:
+            numero_pedido_vinculado = etiqueta_original.get("non_commercial", {}).get("content")
+
+        codigo_correios = info_rastreio.get("tracking")
+
+        # Se tiver o código dos correios e o número do pedido, salva no banco!
+        if codigo_correios and numero_pedido_vinculado:
+            dados_para_supabase = {
+                "codigo_rastreio": codigo_correios,
+                "id_etiqueta_melhor_envio": id_etiqueta_36_chars,
+                "numero_pedido_shopify": str(numero_pedido_vinculado),
+                "eventos_json": info_rastreio.get("events", []),
+                "previsao_entrega": etiqueta_original.get("estimated_delivery")
+            }
+            try:
+                cliente_banco_supabase.table("rastreios_logistica").upsert(dados_para_supabase).execute()
+                quantidade_salva_no_banco += 1
+            except Exception as erro_banco:
+                logger_telemetria.error(f"Erro ao retroalimentar pacote {codigo_correios}: {erro_banco}")
+
+    logger_telemetria.info(f"Sincronização concluída! {quantidade_salva_no_banco} pacotes atualizados no banco.")
+    
+    return {
+        "status": "sucesso", 
+        "etiquetas_encontradas": len(lista_de_ids_secretos), 
+        "salvas_no_supabase": quantidade_salva_no_banco,
+        "mensagem": "Seu banco de dados agora possui o histórico do último mês!"
+    }
