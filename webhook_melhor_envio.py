@@ -1,14 +1,70 @@
+import logging
+import httpx
+import os
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 from typing import Optional, Dict, Any
-import httpx
-import os
 from dotenv import load_dotenv
 from fastapi.middleware.cors import CORSMiddleware
 from datetime import datetime, timedelta
 from fastapi.responses import HTMLResponse
 from typing import List
 from urllib.parse import urlparse, parse_qs
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+logger_telemetria = logging.getLogger("middleware_rastreio")
+
+async def buscar_detalhes_completos_do_pedido_shopify_por_numero(numero_visual_do_pedido: str, token_acesso: str, nome_loja: str) -> Optional[dict]:
+    """Fase 1 e 2: Resolve o identificador público para o ID interno e extrai os itens da linha e Fulfillments."""
+    logger_telemetria.info(f"[Fase 1] Iniciando resolução de identidade na Shopify para o pedido visual: {numero_visual_do_pedido}")
+    
+    url_busca_pedido_completo = f"https://{nome_loja}.myshopify.com/admin/api/2023-07/orders.json?name={numero_visual_do_pedido}&status=any"
+    cabecalhos_autenticacao_shopify = {"X-Shopify-Access-Token": token_acesso, "Content-Type": "application/json"}
+    
+    async with httpx.AsyncClient() as cliente_http_assincrono:
+        resposta_api_shopify = await cliente_http_assincrono.get(url_busca_pedido_completo, headers=cabecalhos_autenticacao_shopify)
+        
+        if resposta_api_shopify.status_code == 200:
+            lista_de_pedidos_encontrados = resposta_api_shopify.json().get("orders", [])
+            if lista_de_pedidos_encontrados:
+                pedido_alvo_encontrado = lista_de_pedidos_encontrados[0]
+                logger_telemetria.info(f"[Fase 1] Sucesso! Pedido {numero_visual_do_pedido} traduzido para ID interno: {pedido_alvo_encontrado.get('id')}")
+                return pedido_alvo_encontrado
+            else:
+                logger_telemetria.warning(f"[Fase 1] Falha na resolução: Nenhum pedido corresponde à string '{numero_visual_do_pedido}'.")
+        else:
+            logger_telemetria.error(f"[Fase 1] Erro crítico de comunicação com Shopify. HTTP Status: {resposta_api_shopify.status_code}")
+            
+    return None
+
+async def buscar_eventos_de_rastreio_em_lote_no_melhor_envio(lista_de_codigos_rastreio: List[str]) -> dict:
+    """Fase 4: Consome a API v2 do Melhor Envio via POST para obter a cronologia exata dos pacotes."""
+    logger_telemetria.info(f"[Fase 4] Iniciando enriquecimento logístico. Códigos solicitados: {lista_de_codigos_rastreio}")
+    
+    url_rastreamento_lote_melhor_envio = "https://www.melhorenvio.com.br/api/v2/me/shipment/tracking"
+    
+    cabecalhos_estritos_melhor_envio = {
+        "Accept": "application/json",
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {TOKEN_API_MELHOR_ENVIO}",
+        "User-Agent": "IntegracaoYkSoftwareHouse/1.0 (seu_email_admin@dominio.com)" 
+    }
+    
+    corpo_da_requisicao_lote = {"orders": lista_de_codigos_rastreio}
+
+    async with httpx.AsyncClient(timeout=20.0) as cliente_http_assincrono:
+        resposta_api_rastreio = await cliente_http_assincrono.post(
+            url_rastreamento_lote_melhor_envio, 
+            headers=cabecalhos_estritos_melhor_envio, 
+            json=corpo_da_requisicao_lote
+        )
+        
+        if resposta_api_rastreio.status_code == 200:
+            logger_telemetria.info(f"[Fase 4] Telemetria logística recuperada com sucesso do servidor do Melhor Envio.")
+            return resposta_api_rastreio.json()
+        else:
+            logger_telemetria.error(f"[Fase 4] Falha ao consumir Melhor Envio. Código {resposta_api_rastreio.status_code}. Motivo: {resposta_api_rastreio.text}")
+            return {}
 
 def extrair_utm_campaign(url: Optional[str]) -> Optional[str]:
     if not url:
@@ -131,6 +187,63 @@ async def alternar_status_enviado(kit_id: str):
             return {"sucesso": True, "novo_status": venda["enviado"]}
     raise HTTPException(status_code=404, detail="Kit não encontrado")
 
+@app_servidor_web.post("/webhook-shopify/pedido-atualizado")
+async def webhook_shopify_pedido_atualizado(data: Dict[str, Any]):
+    kit_id = None
+    for li in data.get("line_items", []) or []:
+        props = li.get("properties") or []
+        if isinstance(props, list):
+            for p in props:
+                if p.get("name") in ["_kit_id", "kit_id"] and p.get("value"):
+                    kit_id = p["value"]
+                    break
+        if kit_id:
+            break
+
+    if not kit_id:
+        return {"status": "ignorado", "motivo": "sem kit_id nas properties"}
+
+    email = data.get("email")
+    customer = data.get("customer") or {}
+    nome = (customer.get("first_name","") + " " + customer.get("last_name","")).strip() or customer.get("name")
+
+    financial_status = (data.get("financial_status") or "").upper()  # paid, pending, authorized...
+    numero = data.get("name")
+    order_id = data.get("id")
+    total_price = float(data.get("total_price") or 0)
+    subtotal_price = float(data.get("subtotal_price") or 0)
+    discounts = float(data.get("total_discounts") or 0)
+    financial_status = (data.get("financial_status") or "").upper()
+
+    for venda in DB_VENDAS_KITS:
+        if venda.get("kit_id") == kit_id:
+            venda["status_pedido"] = "PEDIDO_CRIADO"
+            venda["numero_pedido_shopify"] = numero
+            venda["id_pedido_shopify"] = str(order_id) if order_id else None
+            venda["total_price"] = total_price
+            venda["subtotal_price"] = subtotal_price
+            venda["total_discounts"] = discounts
+            venda["financial_status"] = financial_status
+
+            # marcar como gratuito
+            if total_price == 0:
+                venda["pedido_gratuito"] = True
+                venda["status_pagamento"] = "GRÁTIS"
+            else:
+                venda["pedido_gratuito"] = False
+            if email:
+                venda["email_cliente"] = email
+            if nome and (venda.get("nome_cliente") in [None, "", "Aguardando Pagamento..."]):
+                venda["nome_cliente"] = nome
+
+            if financial_status in ["PAID", "AUTHORIZED"]:
+                venda["status_pagamento"] = "PAGO"
+                venda["status_pedido"] = "PEDIDO_APROVADO"
+
+            return {"status": "ok", "kit_id": kit_id, "financial_status": financial_status}
+
+    return {"status": "nao_encontrado", "kit_id": kit_id}
+
 @app_servidor_web.post("/admin/vendas/alternar-status/{kit_id}")
 async def alternar_status_separacao(kit_id: str):
     for venda in DB_VENDAS_KITS:
@@ -142,6 +255,8 @@ async def alternar_status_separacao(kit_id: str):
 # 4. TELA DE ADMIN COM CHECKLIST
 @app_servidor_web.get("/admin/vendas", response_class=HTMLResponse)
 async def painel_admin_vendas():
+    pedido_gratis = v.get("pedido_gratuito", False)
+    total = v.get("total_price", 0)
     html_content = """
     <html>
         <head>
@@ -201,6 +316,8 @@ async def painel_admin_vendas():
                     <b>Pagamento:</b> {status_pagamento} &nbsp; | &nbsp;
                     <b>Email:</b> {email_cli}
                     </div>
+
+                    {"<div style='margin-top:8px; color:#6c5ce7; font-weight:600;'>💸 Pedido com custo ZERO (Cupom aplicado)</div>" if pedido_gratis else f"<div style='margin-top:8px; color:#28a745; font-weight:600;'>💰 Total: R$ {total}</div>"}
 
                     <div style="margin-top:10px;">
                     <label style="margin-left:12px;">Enviado</label>
@@ -404,7 +521,6 @@ async def processar_evento_de_rastreio(dados_do_webhook: DadosWebhookMelhorEnvio
         "shopify_order_id": id_interno_do_pedido,
     }
 
-    # salva em cache para resposta imediata na GET /tracking/{tracking}
     cache_set(dados_do_webhook.tracking, payload_cache)
 
     if sucesso_na_injecao:
@@ -441,3 +557,101 @@ async def get_tracking(tracking: str):
 
     # 3) se nenhum dado encontrado, devolve objeto vazio (com status 404 optional)
     raise HTTPException(status_code=404, detail="Rastreamento não encontrado.")
+
+@app_servidor_web.get("/api/rastreio/pedido/{numero_do_pedido_cliente}")
+async def expor_contrato_de_rastreio_para_frontend(numero_do_pedido_cliente: str):
+    logger_telemetria.info(f"--- [INICIO] Processando requisição de tela de rastreio para o pedido: {numero_do_pedido_cliente} ---")
+
+    # FASES 1 e 2: Busca dados na Shopify (Identidade, Cliente, Itens)
+    dicionario_pedido_shopify = await buscar_detalhes_completos_do_pedido_shopify_por_numero(
+        numero_do_pedido_cliente, TOKEN_SHOPIFY, NOME_DA_LOJA_SHOPIFY
+    )
+
+    if not dicionario_pedido_shopify:
+        logger_telemetria.warning(f"Fluxo abortado. O identificador {numero_do_pedido_cliente} não existe na plataforma base.")
+        raise HTTPException(status_code=404, detail="Pedido não encontrado.")
+
+    identificador_interno_shopify = dicionario_pedido_shopify.get("id")
+    dados_do_consumidor = dicionario_pedido_shopify.get("customer", {})
+    
+    # Extração defensiva de informações do cliente
+    nome_completo_consumidor = f"{dados_do_consumidor.get('first_name', '')} {dados_do_consumidor.get('last_name', '')}".strip()
+    if not nome_completo_consumidor:
+        nome_completo_consumidor = dados_do_consumidor.get("name", "Cliente não identificado")
+
+    # FASE 2: Iteração dos Line Items
+    logger_telemetria.info("[Fase 2] Mapeando matriz de produtos (Line Items)...")
+    matriz_de_produtos_faturados = []
+    
+    for item_faturado in dicionario_pedido_shopify.get("line_items", []):
+        matriz_de_produtos_faturados.append({
+            "id": item_faturado.get("id"),
+            "title": item_faturado.get("title") or item_faturado.get("name"),
+            "quantity": item_faturado.get("quantity"),
+            "price": item_faturado.get("price"),
+            "product_id": item_faturado.get("product_id"),
+            "variant_id": item_faturado.get("variant_id")
+        })
+    logger_telemetria.info(f"[Fase 2] Foram extraídos {len(matriz_de_produtos_faturados)} produtos faturados para este pedido.")
+
+    # FASE 3: Navegação por Fulfillment Orders e coleta de códigos
+    logger_telemetria.info("[Fase 3] Analisando Ordens de Cumprimento (Fulfillments)...")
+    matriz_de_cumprimentos_shopify = dicionario_pedido_shopify.get("fulfillments", [])
+    lista_plana_codigos_rastreio = []
+    matriz_de_volumes_logisticos = []
+
+    for objeto_cumprimento in matriz_de_cumprimentos_shopify:
+        codigo_de_rastreio_unico = objeto_cumprimento.get("tracking_number")
+        empresa_transportadora = objeto_cumprimento.get("tracking_company")
+
+        if codigo_de_rastreio_unico:
+            lista_plana_codigos_rastreio.append(codigo_de_rastreio_unico)
+            matriz_de_volumes_logisticos.append({
+                "tracking_number": codigo_de_rastreio_unico,
+                "tracking_company": empresa_transportadora,
+                "status_interno_shopify": objeto_cumprimento.get("shipment_status") or "pending",
+                "events": []
+            })
+            logger_telemetria.info(f"[Fase 3] Identificado pacote despachado via {empresa_transportadora}. Código: {codigo_de_rastreio_unico}")
+
+    # FASE 4: Enriquecimento via Melhor Envio
+    if lista_plana_codigos_rastreio:
+        dicionario_eventos_logisticos_brutos = await buscar_eventos_de_rastreio_em_lote_no_melhor_envio(lista_plana_codigos_rastreio)
+
+        logger_telemetria.info("[Fase 4] Correlacionando árvores cronológicas aos pacotes individuais...")
+        
+        for volume_logistico in matriz_de_volumes_logisticos:
+            codigo_atual = volume_logistico["tracking_number"]
+            # O Melhor Envio devolve os objetos indexados pelo código na raiz
+            secao_rastreio_atual = dicionario_eventos_logisticos_brutos.get(codigo_atual, {})
+            
+            eventos_cronologicos = secao_rastreio_atual.get("events", [])
+            volume_logistico["events"] = eventos_cronologicos
+            logger_telemetria.info(f"[Fase 4] {len(eventos_cronologicos)} eventos injetados no pacote {codigo_atual}.")
+    else:
+        logger_telemetria.warning("[Fase 3/4] Pedido não possui objetos de cumprimento ativos. A mercadoria não foi despachada.")
+
+    # FASE 5: Estruturação, Limpeza e Retorno do JSON (Contrato)
+    logger_telemetria.info("[Fase 5] Consolidando contrato JSON limpo e estruturado para o frontend.")
+    
+    contrato_dados_frontend = {
+        "status": "success",
+        "data": {
+            "order": {
+                "customer_order_id": dicionario_pedido_shopify.get("name"),
+                "platform_internal_id": str(identificador_interno_shopify),
+                "created_at": dicionario_pedido_shopify.get("created_at"),
+                "financial_status": dicionario_pedido_shopify.get("financial_status"),
+                "fulfillment_status": dicionario_pedido_shopify.get("fulfillment_status"),
+                "customer": {
+                    "name": nome_completo_consumidor,
+                    "email": dados_do_consumidor.get("email")
+                }
+            },
+            "purchased_items": matriz_de_produtos_faturados,
+            "logistics": matriz_de_volumes_logisticos
+        }
+    }
+
+    logger_telemetria.info(f"--- [FIM] Fluxo de rastreio finalizado com sucesso para: {numero_do_pedido_cliente} ---")
+    return contrato_dados_frontend
