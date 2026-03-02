@@ -10,9 +10,20 @@ from datetime import datetime, timedelta
 from fastapi.responses import HTMLResponse
 from typing import List
 from urllib.parse import urlparse, parse_qs
+from supabase import create_client, Client
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger_telemetria = logging.getLogger("middleware_rastreio")
+
+URL_PROJETO_SUPABASE = os.getenv("SUPABASE_URL")
+CHAVE_PUBLICA_SUPABASE = os.getenv("SUPABASE_KEY")
+
+cliente_banco_supabase: Optional[Client] = None
+if URL_PROJETO_SUPABASE and CHAVE_PUBLICA_SUPABASE:
+    cliente_banco_supabase = create_client(URL_PROJETO_SUPABASE, CHAVE_PUBLICA_SUPABASE)
+    logger_telemetria.info("Conexão com banco de dados Supabase inicializada com sucesso.")
+else:
+    logger_telemetria.warning("Chaves do Supabase ausentes no .env. Banco de dados inativo.")
 
 async def buscar_detalhes_completos_do_pedido_shopify_por_numero(numero_visual_do_pedido: str, token_acesso: str, nome_loja: str) -> Optional[dict]:
     """Fase 1 e 2: Resolve o identificador público para o ID interno e extrai os itens da linha e Fulfillments."""
@@ -512,16 +523,23 @@ async def processar_evento_de_rastreio(dados_do_webhook: DadosWebhookMelhorEnvio
         if evs and isinstance(evs, dict) and evs.get("events"):
             timeline_events = evs.get("events")
 
-    payload_cache = {
-        "tracking": dados_do_webhook.tracking,
-        "updated_at": now_iso(),
-        "eta": detalhes.get("estimated_delivery") or None,
-        "events": timeline_events,
-        "source_order_number": numero_do_pedido,
-        "shopify_order_id": id_interno_do_pedido,
-    }
-
-    cache_set(dados_do_webhook.tracking, payload_cache)
+    if cliente_banco_supabase:
+        dados_para_salvar_no_banco = {
+            "codigo_rastreio": dados_do_webhook.tracking,
+            "id_etiqueta_melhor_envio": dados_do_webhook.id,
+            "numero_pedido_shopify": numero_do_pedido,
+            "eventos_json": timeline_events,
+            "previsao_entrega": detalhes.get("estimated_delivery")
+        }
+        try:
+            # O comando 'upsert' é inteligente: se o rastreio já existir, ele atualiza a linha. Se não, ele cria.
+            cliente_banco_supabase.table("rastreios_logistica").upsert(dados_para_salvar_no_banco).execute()
+            logger_telemetria.info(f"O pacote {dados_do_webhook.tracking} se moveu! Dados salvos no Supabase.")
+        except Exception as erro_gravacao_banco:
+            logger_telemetria.error(f"Falha ao gravar histórico no Supabase: {erro_gravacao_banco}")
+    else:
+        # Fallback de segurança para a memória RAM caso o Supabase não esteja ligado
+        cache_set(dados_do_webhook.tracking, payload_cache)
 
     if sucesso_na_injecao:
         return {"status": "sucesso", "pedido": numero_do_pedido}
@@ -616,18 +634,32 @@ async def expor_contrato_de_rastreio_para_frontend(numero_do_pedido_cliente: str
 
     # FASE 4: Enriquecimento via Melhor Envio
     if lista_plana_codigos_rastreio:
-        dicionario_eventos_logisticos_brutos = await buscar_eventos_de_rastreio_em_lote_no_melhor_envio(lista_plana_codigos_rastreio)
-
-        logger_telemetria.info("[Fase 4] Correlacionando árvores cronológicas aos pacotes individuais...")
+        logger_telemetria.info("[Fase 4] Buscando histórico logístico direto no nosso banco de dados Supabase...")
         
-        for volume_logistico in matriz_de_volumes_logisticos:
-            codigo_atual = volume_logistico["tracking_number"]
-            # O Melhor Envio devolve os objetos indexados pelo código na raiz
-            secao_rastreio_atual = dicionario_eventos_logisticos_brutos.get(codigo_atual, {})
+        if cliente_banco_supabase:
+            try:
+                # Busca todos os códigos do pedido no banco de uma só vez
+                resposta_do_banco = cliente_banco_supabase.table("rastreios_logistica").select("*").in_("codigo_rastreio", lista_plana_codigos_rastreio).execute()
+                
+                # Transforma a lista numa espécie de dicionário/mapa para achar rápido pelo código
+                mapa_rastreios_encontrados_no_banco = {linha["codigo_rastreio"]: linha for linha in resposta_do_banco.data}
+                
+                for volume_logistico in matriz_de_volumes_logisticos:
+                    codigo_atual = volume_logistico["tracking_number"]
+                    dados_salvos_no_banco = mapa_rastreios_encontrados_no_banco.get(codigo_atual)
+                    
+                    if dados_salvos_no_banco:
+                        eventos_cronologicos = dados_salvos_no_banco.get("eventos_json", [])
+                        volume_logistico["events"] = eventos_cronologicos
+                        volume_logistico["eta"] = dados_salvos_no_banco.get("previsao_entrega")
+                        logger_telemetria.info(f"[Fase 4] Sucesso! {len(eventos_cronologicos)} eventos lidos da memória do banco para a etiqueta {codigo_atual}.")
+                    else:
+                        logger_telemetria.info(f"[Fase 4] A encomenda {codigo_atual} ainda não recebeu Webhooks de movimentação. Linha do tempo vazia.")
             
-            eventos_cronologicos = secao_rastreio_atual.get("events", [])
-            volume_logistico["events"] = eventos_cronologicos
-            logger_telemetria.info(f"[Fase 4] {len(eventos_cronologicos)} eventos injetados no pacote {codigo_atual}.")
+            except Exception as erro_leitura_banco:
+                logger_telemetria.error(f"[Fase 4] Erro interno ao ler do banco de dados: {erro_leitura_banco}")
+        else:
+            logger_telemetria.warning("[Fase 4] Supabase desconectado. Tela será montada sem o histórico da linha do tempo.")
     else:
         logger_telemetria.warning("[Fase 3/4] Pedido não possui objetos de cumprimento ativos. A mercadoria não foi despachada.")
 
