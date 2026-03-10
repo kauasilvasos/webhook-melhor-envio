@@ -10,6 +10,7 @@ from datetime import datetime, timedelta
 from fastapi.responses import HTMLResponse
 from typing import List
 from urllib.parse import urlparse, parse_qs
+from datetime import datetime
 from supabase import create_client, Client
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
@@ -18,9 +19,177 @@ logger_telemetria = logging.getLogger("middleware_rastreio")
 URL_PROJETO_SUPABASE = os.getenv("SUPABASE_URL")
 CHAVE_PUBLICA_SUPABASE = os.getenv("SUPABASE_KEY")
 
+ME_SYNC_STATUSES = os.getenv(
+    "ME_SYNC_STATUSES",
+    "pending,released,posted,delivered"
+)
+ME_SYNC_LIMIT = int(os.getenv("ME_SYNC_LIMIT", "100"))
+ME_SYNC_MAX_PAGES = int(os.getenv("ME_SYNC_MAX_PAGES", "20"))
+
 cliente_banco_supabase: Optional[Client] = None
 if URL_PROJETO_SUPABASE and CHAVE_PUBLICA_SUPABASE:
     cliente_banco_supabase = create_client(URL_PROJETO_SUPABASE, CHAVE_PUBLICA_SUPABASE)
+    def _safe_float(v):
+        try:
+            if v is None or v == "":
+                return None
+            return float(v)
+        except Exception:
+            return None
+
+    def _safe_int(v):
+        try:
+            if v is None or v == "":
+                return None
+            return int(v)
+        except Exception:
+            return None
+
+    def _upper(v: str | None):
+        return (v or "").upper() or None
+
+    def _normalize_order_name(name: str | None) -> str | None:
+        # Shopify manda "#1554"
+        if not name:
+            return None
+        return name.strip()
+
+    def supa_upsert_venda_from_shopify(order: dict):
+        """
+        Cria/atualiza 1 linha em public.vendas usando shopify_order_id como chave.
+        """
+        if not cliente_banco_supabase:
+            return None
+
+        order_id = str(order.get("id")) if order.get("id") else None
+        if not order_id:
+            return None
+
+        customer = order.get("customer") or {}
+        email = order.get("email") or customer.get("email")
+        nome = (customer.get("first_name","") + " " + customer.get("last_name","")).strip() or customer.get("name")
+
+        landing_site = order.get("landing_site") or ""
+        kit_id = extrair_utm_campaign(landing_site)
+
+        total_price = _safe_float(order.get("total_price"))
+        subtotal_price = _safe_float(order.get("subtotal_price"))
+        discounts = _safe_float(order.get("total_discounts"))
+
+        financial_status = _upper(order.get("financial_status"))
+        fulfillment_status = _upper(order.get("fulfillment_status"))
+
+        pedido_gratuito = (total_price == 0) if total_price is not None else False
+        status_pagamento = "GRÁTIS" if pedido_gratuito else ("PAGO" if financial_status in ["PAID", "AUTHORIZED"] else "PENDENTE")
+
+        payload = {
+            "shopify_order_id": order_id,
+            "shopify_order_name": _normalize_order_name(order.get("name")),
+            "shopify_created_at": order.get("created_at"),
+            "financial_status": financial_status,
+            "fulfillment_status": fulfillment_status,
+            "customer_shopify_id": str(customer.get("id")) if customer.get("id") else None,
+            "nome_cliente": nome,
+            "email_cliente": email,
+            "total_price": total_price,
+            "subtotal_price": subtotal_price,
+            "total_discounts": discounts,
+            "pedido_gratuito": pedido_gratuito,
+            "status_pagamento": status_pagamento,
+            "kit_id": kit_id,
+            "landing_site": landing_site,
+            "payload_shopify": order,  # opcional: snapshot
+        }
+
+        res = cliente_banco_supabase.table("vendas").upsert(payload, on_conflict="shopify_order_id").execute()
+        # retorna a linha inserida/atualizada (depende do client), mas normalmente vem em res.data
+        if getattr(res, "data", None):
+            return res.data[0]
+        return None
+
+    def supa_upsert_itens_from_shopify(venda_id: str, order: dict):
+        """
+        Sobe line_items em public.venda_itens (evita duplicar via uniq index).
+        """
+        if not cliente_banco_supabase or not venda_id:
+            return
+
+        itens = order.get("line_items") or []
+        rows = []
+        for li in itens:
+            rows.append({
+                "venda_id": venda_id,
+                "shopify_line_item_id": str(li.get("id")) if li.get("id") else None,
+                "product_id": str(li.get("product_id")) if li.get("product_id") else None,
+                "variant_id": str(li.get("variant_id")) if li.get("variant_id") else None,
+                "title": li.get("title") or li.get("name"),
+                "quantity": _safe_int(li.get("quantity")),
+                "price": _safe_float(li.get("price")),
+                "properties": li.get("properties") or None,
+            })
+
+        if rows:
+            # on_conflict aqui depende do seu unique index: (venda_id, shopify_line_item_id)
+            cliente_banco_supabase.table("venda_itens").upsert(
+                rows, on_conflict="venda_id,shopify_line_item_id"
+            ).execute()
+
+    def supa_update_venda_from_yampi(kit_id: str, nome: str | None, email: str | None, payload_yampi: dict):
+        """
+        Atualiza venda via kit_id (utm_campaign) enquanto o Shopify ainda não completou tudo.
+        """
+        if not cliente_banco_supabase or not kit_id:
+            return
+
+        update = {
+            "nome_cliente": nome,
+            "email_cliente": email,
+            "status_pagamento": "PAGO",     # se a yampi marcou como pago
+            "payload_yampi": payload_yampi,
+            "fonte_criacao": "yampi",
+        }
+
+        # update por kit_id (pode afetar mais de uma se reutilizar kit_id; em geral é 1)
+        cliente_banco_supabase.table("vendas").update(update).eq("kit_id", kit_id).execute()
+
+    def supa_upsert_envio(
+        melhor_envio_etiqueta_id: str,
+        status_envio: str | None,
+        codigo_rastreio: str | None,
+        transportadora: str | None,
+        previsao_entrega: str | None,
+        eventos: list,
+        numero_pedido_shopify: str | None,
+        payload_me: dict | None,
+        shopify_order_id: str | None
+    ):
+        """
+        Cria/atualiza 1 envio em public.envios. Linka com venda via shopify_order_id.
+        """
+        if not cliente_banco_supabase or not melhor_envio_etiqueta_id:
+            return
+
+        venda_id = None
+        if shopify_order_id:
+            v = cliente_banco_supabase.table("vendas").select("id").eq("shopify_order_id", str(shopify_order_id)).limit(1).execute()
+            if getattr(v, "data", None):
+                venda_id = v.data[0]["id"]
+
+        payload = {
+            "venda_id": venda_id,
+            "melhor_envio_etiqueta_id": melhor_envio_etiqueta_id,
+            "status_envio": status_envio,
+            "codigo_rastreio": codigo_rastreio,
+            "transportadora": transportadora,
+            "previsao_entrega": previsao_entrega,
+            "eventos_json": eventos or [],
+            "numero_pedido_shopify": numero_pedido_shopify,
+            "payload_melhor_envio": payload_me,
+        }
+
+        cliente_banco_supabase.table("envios").upsert(payload, on_conflict="melhor_envio_etiqueta_id").execute()
+    
+    
     logger_telemetria.info("Conexão com banco de dados Supabase inicializada com sucesso.")
 else:
     logger_telemetria.warning("Chaves do Supabase ausentes no .env. Banco de dados inativo.")
@@ -152,6 +321,44 @@ async def webhook_shopify_pedido_pago(data: Dict[str, Any]):
 
     return {"status": "nao_encontrado", "pedido": numero}
 
+def supa_salvar_selecao_kit(payload: dict):
+    """
+    Salva/atualiza a seleção do kit (cores e tamanhos por unidade) no Supabase.
+    Tabela: kit_selecoes  (kit_id TEXT UNIQUE, nome_produto TEXT,
+                           quantidade_itens INT, detalhes JSONB,
+                           data_hora TIMESTAMPTZ, status_pagamento TEXT,
+                           numero_pedido_shopify TEXT)
+    Crie a tabela com:
+        CREATE TABLE kit_selecoes (
+            id              BIGSERIAL PRIMARY KEY,
+            kit_id          TEXT UNIQUE NOT NULL,
+            nome_produto    TEXT,
+            quantidade_itens INT,
+            detalhes        JSONB,
+            data_hora       TIMESTAMPTZ,
+            status_pagamento TEXT DEFAULT 'PENDENTE',
+            numero_pedido_shopify TEXT,
+            created_at      TIMESTAMPTZ DEFAULT now()
+        );
+    """
+    if not cliente_banco_supabase:
+        return
+    try:
+        row = {
+            "kit_id":           payload["kit_id"],
+            "nome_produto":     payload.get("nome_produto"),
+            "quantidade_itens": payload.get("quantidade_itens"),
+            "detalhes":         payload.get("detalhes"),
+            "data_hora":        payload.get("data_hora"),
+            "status_pagamento": "PENDENTE",
+        }
+        cliente_banco_supabase.table("kit_selecoes").upsert(
+            row, on_conflict="kit_id"
+        ).execute()
+    except Exception as e:
+        logger_telemetria.error(f"[kit_selecoes] Erro ao salvar no Supabase: {e}")
+
+
 @app_servidor_web.post("/Venda")
 async def registrar_venda_kit(payload: VendaPayload):
     nova_venda = payload.dict()
@@ -165,6 +372,7 @@ async def registrar_venda_kit(payload: VendaPayload):
     nova_venda["enviado"] = False
 
     DB_VENDAS_KITS.append(nova_venda)
+    supa_salvar_selecao_kit(nova_venda)
     return {"status": "sucesso", "kit_id": payload.kit_id}
 
 # 2. WEBHOOK DA YAMPI (PARA ATUALIZAR O NOME DO CLIENTE QUANDO PAGAR)
@@ -722,81 +930,101 @@ async def capturar_token_oauth(shop: str, code: str):
 
 @app_servidor_web.get("/admin/sincronizar-historico")
 async def retroalimentar_banco_de_dados_supabase():
-    """Rota temporária para popular o banco de dados com etiquetas antigas do Melhor Envio."""
+    """Rota temporária para popular o banco com etiquetas antigas (inclui pending)."""
     if not cliente_banco_supabase:
         return {"erro": "Conexão com Supabase não estabelecida. Verifique as chaves no Render."}
 
-    logger_telemetria.info("Iniciando varredura retroativa no Melhor Envio...")
+    logger_telemetria.info("Iniciando varredura retroativa no Melhor Envio (incluindo pending)...")
 
-    # Passo 1: Buscar as últimas 50 etiquetas geradas (que já foram postadas ou entregues)
-    url_listar_pedidos_antigos = "https://www.melhorenvio.com.br/api/v2/me/orders?status=released,posted,delivered&limit=50"
+    # Configuráveis via env (opcional)
+    statuses = os.getenv("ME_SYNC_STATUSES", "pending,released,posted,delivered")
+    limit = int(os.getenv("ME_SYNC_LIMIT", "100"))
+    max_pages = int(os.getenv("ME_SYNC_MAX_PAGES", "20"))
+
     cabecalhos_acesso = {
         "Authorization": f"Bearer {TOKEN_API_MELHOR_ENVIO}",
         "Accept": "application/json",
         "User-Agent": "IntegracaoYkSoftwareHouse/1.0"
     }
 
+    # 1) Pagina e junta tudo
+    etiquetas = []
     async with httpx.AsyncClient(timeout=30.0) as cliente_http:
-        resposta_listagem = await cliente_http.get(url_listar_pedidos_antigos, headers=cabecalhos_acesso)
+        for page in range(1, max_pages + 1):
+            url = (
+                "https://www.melhorenvio.com.br/api/v2/me/orders"
+                f"?status={statuses}&limit={limit}&page={page}"
+            )
+            resp = await cliente_http.get(url, headers=cabecalhos_acesso)
 
-    if resposta_listagem.status_code != 200:
-        return {"erro": "Falha ao listar pedidos antigos", "detalhes": resposta_listagem.text}
+            if resp.status_code != 200:
+                return {"erro": "Falha ao listar pedidos", "detalhes": resp.text, "url": url}
 
-    # A API do ME geralmente retorna a lista dentro de um dicionário chamado 'data'
-    dados_resposta = resposta_listagem.json()
-    matriz_de_etiquetas_antigas = dados_resposta.get("data", []) if isinstance(dados_resposta, dict) else dados_resposta
+            payload = resp.json()
+            page_data = payload.get("data", []) if isinstance(payload, dict) else payload
 
-    # Extrai apenas os códigos UUID (36 caracteres)
-    lista_de_ids_secretos = [etiqueta.get("id") for etiqueta in matriz_de_etiquetas_antigas if etiqueta.get("id")]
+            if not page_data:
+                break
 
-    if not lista_de_ids_secretos:
-        return {"mensagem": "Nenhuma etiqueta antiga encontrada para sincronizar."}
+            etiquetas.extend(page_data)
+            logger_telemetria.info(f"[ME] Página {page}: +{len(page_data)} (total {len(etiquetas)})")
 
-    logger_telemetria.info(f"Encontradas {len(lista_de_ids_secretos)} etiquetas. Buscando histórico logístico em lote...")
+    if not etiquetas:
+        return {"mensagem": "Nenhuma etiqueta encontrada para sincronizar."}
 
-    # Passo 2: Usar a nossa função de lote para pegar os eventos de todos de uma vez
+    # IDs das etiquetas
+    lista_de_ids_secretos = [e.get("id") for e in etiquetas if e.get("id")]
+    logger_telemetria.info(f"Encontradas {len(lista_de_ids_secretos)} etiquetas. Buscando eventos em lote...")
+
+    # 2) Busca eventos/tracking em lote
     dicionario_eventos_historicos = await buscar_eventos_de_rastreio_em_lote_no_melhor_envio(lista_de_ids_secretos)
-    
+
     quantidade_salva_no_banco = 0
+    quantidade_sem_tracking = 0
 
-    # Passo 3: Cruzar as informações e salvar no Supabase
-    for id_etiqueta_36_chars, info_rastreio in dicionario_eventos_historicos.items():
-        # Acha a etiqueta original na lista para descobrirmos o numero do pedido (tag)
-        etiqueta_original = next((e for e in matriz_de_etiquetas_antigas if e.get("id") == id_etiqueta_36_chars), {})
-        
-        # Tenta achar o número do pedido (ex: #1554)
-        lista_de_tags = etiqueta_original.get("tags", [])
+    # 3) Salva no Supabase (somente quando tiver tracking + número)
+    for id_etiqueta, info_rastreio in (dicionario_eventos_historicos or {}).items():
+        etiqueta_original = next((e for e in etiquetas if e.get("id") == id_etiqueta), {}) or {}
+
+        # número do pedido (tag)
         numero_pedido_vinculado = None
-        
-        if lista_de_tags:
-            primeira_tag = lista_de_tags[0]
-            numero_pedido_vinculado = primeira_tag.get("tag") if isinstance(primeira_tag, dict) else primeira_tag
-        
+        tags = etiqueta_original.get("tags", [])
+        if tags:
+            primeira = tags[0]
+            numero_pedido_vinculado = primeira.get("tag") if isinstance(primeira, dict) else primeira
         if not numero_pedido_vinculado:
-            numero_pedido_vinculado = etiqueta_original.get("non_commercial", {}).get("content")
+            numero_pedido_vinculado = (etiqueta_original.get("non_commercial") or {}).get("content")
 
-        codigo_correios = info_rastreio.get("tracking")
+        codigo_correios = (info_rastreio or {}).get("tracking")
 
-        # Se tiver o código dos correios e o número do pedido, salva no banco!
+        # pending costuma cair aqui (sem tracking)
+        if not codigo_correios:
+            quantidade_sem_tracking += 1
+            continue
+
         if codigo_correios and numero_pedido_vinculado:
             dados_para_supabase = {
                 "codigo_rastreio": codigo_correios,
-                "id_etiqueta_melhor_envio": id_etiqueta_36_chars,
+                "id_etiqueta_melhor_envio": id_etiqueta,
                 "numero_pedido_shopify": str(numero_pedido_vinculado),
-                "eventos_json": info_rastreio.get("events", []),
-                "previsao_entrega": etiqueta_original.get("estimated_delivery")
+                "eventos_json": (info_rastreio or {}).get("events", []),
+                "previsao_entrega": etiqueta_original.get("estimated_delivery"),
+                "atualizado_em": datetime.utcnow().isoformat() + "Z",
             }
             try:
                 cliente_banco_supabase.table("rastreios_logistica").upsert(dados_para_supabase).execute()
                 quantidade_salva_no_banco += 1
             except Exception as erro_banco:
-                logger_telemetria.error(f"Erro ao retroalimentar pacote {codigo_correios}: {erro_banco}")
+                logger_telemetria.error(f"Erro ao salvar pacote {codigo_correios}: {erro_banco}")
 
-    logger_telemetria.info(f"Sincronização concluída! {quantidade_salva_no_banco} pacotes atualizados no banco.")
-    
+    logger_telemetria.info(
+        f"Sincronização concluída! salvos={quantidade_salva_no_banco} | sem_tracking={quantidade_sem_tracking} | total_etiquetas={len(lista_de_ids_secretos)}"
+    )
+
     return {
-        "status": "sucesso", 
-        "etiquetas_encontradas": len(lista_de_ids_secretos), 
+        "status": "sucesso",
+        "etiquetas_encontradas": len(lista_de_ids_secretos),
         "salvas_no_supabase": quantidade_salva_no_banco,
-        "mensagem": "Seu banco de dados agora possui o histórico do último mês!"
+        "sem_tracking": quantidade_sem_tracking,
+        "mensagem": "Sincronização concluída (pending incluído na busca; só salva quando existir tracking)."
     }
