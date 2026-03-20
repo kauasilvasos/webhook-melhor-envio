@@ -323,22 +323,22 @@ async def webhook_shopify_pedido_pago(data: Dict[str, Any]):
 
 def supa_salvar_selecao_kit(payload: dict):
     """
-    Salva/atualiza a seleção do kit (cores e tamanhos por unidade) no Supabase.
-    Tabela: kit_selecoes  (kit_id TEXT UNIQUE, nome_produto TEXT,
-                           quantidade_itens INT, detalhes JSONB,
-                           data_hora TIMESTAMPTZ, status_pagamento TEXT,
-                           numero_pedido_shopify TEXT)
+    Salva a seleção inicial do kit (cores e tamanhos por unidade).
     Crie a tabela com:
         CREATE TABLE kit_selecoes (
-            id              BIGSERIAL PRIMARY KEY,
-            kit_id          TEXT UNIQUE NOT NULL,
-            nome_produto    TEXT,
+            id               BIGSERIAL PRIMARY KEY,
+            kit_id           TEXT UNIQUE NOT NULL,
+            nome_produto     TEXT,
             quantidade_itens INT,
-            detalhes        JSONB,
-            data_hora       TIMESTAMPTZ,
+            detalhes         JSONB,
+            data_hora        TIMESTAMPTZ,
             status_pagamento TEXT DEFAULT 'PENDENTE',
-            numero_pedido_shopify TEXT,
-            created_at      TIMESTAMPTZ DEFAULT now()
+            nome_cliente     TEXT,
+            email_cliente    TEXT,
+            telefone_cliente TEXT,
+            cpf_cliente      TEXT,
+            payload_yampi    JSONB,
+            created_at       TIMESTAMPTZ DEFAULT now()
         );
     """
     if not cliente_banco_supabase:
@@ -357,6 +357,24 @@ def supa_salvar_selecao_kit(payload: dict):
         ).execute()
     except Exception as e:
         logger_telemetria.error(f"[kit_selecoes] Erro ao salvar no Supabase: {e}")
+
+
+def supa_atualizar_kit_com_yampi(kit_id: str, nome: str | None, email: str | None, telefone: str | None, cpf: str | None, payload_yampi: dict):
+    """Atualiza kit_selecoes com dados do cliente após pagamento na Yampi."""
+    if not cliente_banco_supabase or not kit_id:
+        return
+    try:
+        update = {
+            "status_pagamento": "PAGO",
+            "nome_cliente":     nome,
+            "email_cliente":    email,
+            "telefone_cliente": telefone,
+            "cpf_cliente":      cpf,
+            "payload_yampi":    payload_yampi,
+        }
+        cliente_banco_supabase.table("kit_selecoes").update(update).eq("kit_id", kit_id).execute()
+    except Exception as e:
+        logger_telemetria.error(f"[kit_selecoes] Erro ao atualizar com Yampi: {e}")
 
 
 @app_servidor_web.post("/Venda")
@@ -378,25 +396,49 @@ async def registrar_venda_kit(payload: VendaPayload):
 # 2. WEBHOOK DA YAMPI (PARA ATUALIZAR O NOME DO CLIENTE QUANDO PAGAR)
 @app_servidor_web.post("/webhook-yampi")
 async def webhook_yampi(data: Dict[str, Any]):
-    cart_data = data.get("resource", {})
+    cart_data     = data.get("resource", {})
     customer_data = cart_data.get("customer", {})
-    nome_real = customer_data.get("name", "Cliente Yampi")
-    email_real = customer_data.get("email")
 
-    
-    # Busca o ID do Kit nas UTMs enviadas pela Yampi
-    utm_campaign = cart_data.get("utm_campaign") or cart_data.get("tracking", {}).get("utm_campaign")
-    
-    if utm_campaign:
+    nome_real     = customer_data.get("name") or (
+        (customer_data.get("first_name") or "") + " " + (customer_data.get("last_name") or "")
+    ).strip() or "Cliente Yampi"
+    email_real    = customer_data.get("email")
+    telefone_real = customer_data.get("phone") or customer_data.get("mobile_phone")
+    cpf_real      = customer_data.get("cpf") or customer_data.get("document")
+
+    # Estratégia 1: busca _kit_id nas properties dos itens do pedido
+    # (é o cart token do Shopify, gravado como properties[_kit_id] no momento do add-to-cart)
+    kit_id = None
+    for item in (cart_data.get("items") or cart_data.get("line_items") or []):
+        props = item.get("properties") or []
+        if isinstance(props, list):
+            for p in props:
+                if p.get("name") == "_kit_id" and p.get("value"):
+                    kit_id = p["value"]
+                    break
+        elif isinstance(props, dict):
+            kit_id = props.get("_kit_id")
+        if kit_id:
+            break
+
+    # Estratégia 2: fallback por utm_campaign (caso Yampi passe o token via UTM)
+    if not kit_id:
+        kit_id = (
+            cart_data.get("utm_campaign")
+            or (cart_data.get("tracking") or {}).get("utm_campaign")
+        )
+
+    if kit_id:
         for venda in DB_VENDAS_KITS:
-            if venda["kit_id"] == utm_campaign:
-                venda["nome_cliente"] = nome_real
-                if email_real:
-                    venda["email_cliente"] = email_real
+            if venda["kit_id"] == kit_id:
+                venda["nome_cliente"]     = nome_real
+                venda["email_cliente"]    = email_real
                 venda["status_pagamento"] = "PAGO"
                 break
-                
-    return {"status": "recebido"}
+
+        supa_atualizar_kit_com_yampi(kit_id, nome_real, email_real, telefone_real, cpf_real, data)
+
+    return {"status": "recebido", "kit_id_encontrado": kit_id}
 
 @app_servidor_web.post("/admin/vendas/alternar-enviado/{kit_id}")
 async def alternar_status_enviado(kit_id: str):
@@ -554,10 +596,135 @@ async def painel_admin_vendas():
     html_content += "</body></html>"
     return html_content
 
+
+@app_servidor_web.get("/admin/pedidos", response_class=HTMLResponse)
+async def painel_admin_pedidos():
+    """Tabela de pedidos com cliente + itens do kit, alimentada pelo Supabase."""
+    rows = []
+    erro_supabase = None
+
+    if cliente_banco_supabase:
+        try:
+            res = (
+                cliente_banco_supabase
+                .table("kit_selecoes")
+                .select("*")
+                .order("created_at", desc=True)
+                .limit(200)
+                .execute()
+            )
+            rows = res.data or []
+        except Exception as e:
+            erro_supabase = str(e)
+    else:
+        erro_supabase = "Supabase não configurado (variáveis SUPABASE_URL / SUPABASE_KEY ausentes)."
+
+    def badge_status(s):
+        s = (s or "PENDENTE").upper()
+        cor = {"PAGO": "#22c55e", "GRÁTIS": "#a855f7"}.get(s, "#f59e0b")
+        return f'<span style="background:{cor};color:#fff;padding:2px 10px;border-radius:20px;font-size:11px;font-weight:600;">{s}</span>'
+
+    def itens_html(detalhes):
+        if not detalhes:
+            return "<em style='color:#999'>—</em>"
+        partes = []
+        for item in detalhes:
+            u = item.get("unidade", "")
+            c = item.get("cor", "—")
+            t = item.get("tamanho", "—")
+            partes.append(
+                f'<div style="margin-bottom:4px;">'
+                f'<span style="font-size:10px;color:#6b7280;text-transform:uppercase;">{u}</span><br>'
+                f'<b>{c}</b> &nbsp;/&nbsp; {t}'
+                f'</div>'
+            )
+        return "".join(partes)
+
+    def fmt_data(d):
+        if not d:
+            return "—"
+        try:
+            from datetime import datetime as dt
+            return dt.fromisoformat(d.replace("Z", "+00:00")).strftime("%d/%m/%Y %H:%M")
+        except Exception:
+            return d[:16]
+
+    linhas_html = ""
+    if not rows:
+        linhas_html = '<tr><td colspan="6" style="text-align:center;padding:40px;color:#999;">Nenhum pedido encontrado.</td></tr>'
+    else:
+        for r in rows:
+            linhas_html += f"""
+            <tr>
+              <td>{fmt_data(r.get('created_at'))}</td>
+              <td>
+                <div style="font-weight:600">{r.get('nome_cliente') or '<em style="color:#999">Aguardando</em>'}</div>
+                <div style="font-size:12px;color:#6b7280">{r.get('email_cliente') or ''}</div>
+                <div style="font-size:12px;color:#6b7280">{r.get('telefone_cliente') or ''}</div>
+              </td>
+              <td>
+                <div style="font-weight:600">{r.get('nome_produto') or '—'}</div>
+                <div style="font-size:12px;color:#6b7280">{r.get('quantidade_itens') or 0} unidades</div>
+              </td>
+              <td>{itens_html(r.get('detalhes'))}</td>
+              <td>{badge_status(r.get('status_pagamento'))}</td>
+              <td style="font-size:11px;color:#9ca3af;font-family:monospace">{r.get('kit_id','')[:12]}…</td>
+            </tr>"""
+
+    aviso_erro = f'<div style="background:#fef2f2;border:1px solid #fca5a5;padding:12px 16px;border-radius:8px;margin-bottom:20px;color:#dc2626;">⚠️ {erro_supabase}</div>' if erro_supabase else ""
+
+    html = f"""<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+  <meta charset="UTF-8">
+  <title>Pedidos de Kit</title>
+  <style>
+    *, *::before, *::after {{ box-sizing: border-box; }}
+    body {{ font-family: 'Segoe UI', sans-serif; background: #f8fafc; padding: 32px; color: #1e293b; }}
+    h1   {{ font-size: 22px; font-weight: 700; margin-bottom: 4px; }}
+    p.sub {{ color: #64748b; font-size: 13px; margin-bottom: 24px; }}
+    .card {{ background: #fff; border-radius: 12px; box-shadow: 0 1px 4px rgba(0,0,0,.08); overflow: hidden; }}
+    table {{ width: 100%; border-collapse: collapse; }}
+    thead tr {{ background: #f1f5f9; }}
+    th {{ text-align: left; padding: 12px 16px; font-size: 11px; text-transform: uppercase;
+          letter-spacing: .06em; color: #64748b; font-weight: 600; white-space: nowrap; }}
+    td {{ padding: 14px 16px; border-top: 1px solid #f1f5f9; vertical-align: top; font-size: 13px; }}
+    tr:hover td {{ background: #f8fafc; }}
+    a.nav {{ display:inline-block; margin-bottom:16px; font-size:13px; color:#3b82f6; text-decoration:none; }}
+    a.nav:hover {{ text-decoration:underline; }}
+  </style>
+</head>
+<body>
+  <a class="nav" href="/admin/vendas">← Fila de separação</a>
+  <h1>Pedidos de Kit</h1>
+  <p class="sub">Itens escolhidos pelo cliente, salvos no momento de adicionar ao carrinho.</p>
+  {aviso_erro}
+  <div class="card">
+    <table>
+      <thead>
+        <tr>
+          <th>Data</th>
+          <th>Cliente</th>
+          <th>Produto</th>
+          <th>Itens escolhidos</th>
+          <th>Status</th>
+          <th>ID</th>
+        </tr>
+      </thead>
+      <tbody>
+        {linhas_html}
+      </tbody>
+    </table>
+  </div>
+</body>
+</html>"""
+    return html
+
+
 app_servidor_web.add_middleware(
     CORSMiddleware,
     allow_origins=ALLOWED_ORIGINS,
-    allow_credentials=True,
+    allow_credentials=ALLOWED_ORIGINS != ["*"],  # credentials=True só com origens específicas
     allow_methods=["GET", "POST", "OPTIONS"],
     allow_headers=["*"],
 )
@@ -1028,3 +1195,230 @@ async def retroalimentar_banco_de_dados_supabase():
         "sem_tracking": quantidade_sem_tracking,
         "mensagem": "Sincronização concluída (pending incluído na busca; só salva quando existir tracking)."
     }
+
+
+# ---------------------------
+# INVENTÁRIO / ESTOQUE
+# ---------------------------
+
+async def _buscar_produtos_shopify_paginado() -> List[dict]:
+    """Busca todos os produtos com variants e inventory_quantity via paginação de cursor."""
+    headers = {"X-Shopify-Access-Token": TOKEN_SHOPIFY, "Content-Type": "application/json"}
+    produtos = []
+    url = f"https://{NOME_DA_LOJA_SHOPIFY}.myshopify.com/admin/api/2024-01/products.json?limit=250&fields=id,title,variants,status"
+
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        while url:
+            resp = await client.get(url, headers=headers)
+            if resp.status_code != 200:
+                logger_telemetria.error(f"[Estoque] Erro ao buscar produtos: {resp.status_code} {resp.text}")
+                break
+            data = resp.json()
+            produtos.extend(data.get("products", []))
+
+            # paginação via Link header
+            link_header = resp.headers.get("Link", "")
+            next_url = None
+            for part in link_header.split(","):
+                if 'rel="next"' in part:
+                    next_url = part.strip().split(";")[0].strip().strip("<>")
+                    break
+            url = next_url
+
+    return produtos
+
+
+def _montar_estoque_de_produtos(produtos: List[dict]) -> List[dict]:
+    """Transforma a lista de produtos em uma view plana de estoque por variant."""
+    resultado = []
+    for produto in produtos:
+        for variant in produto.get("variants", []):
+            resultado.append({
+                "produto_id": str(produto.get("id")),
+                "produto_titulo": produto.get("title"),
+                "variant_id": str(variant.get("id")),
+                "variant_titulo": variant.get("title"),
+                "sku": variant.get("sku"),
+                "inventory_item_id": str(variant.get("inventory_item_id")),
+                "inventory_quantity": variant.get("inventory_quantity", 0),
+                "status_produto": produto.get("status"),
+            })
+    return resultado
+
+
+@app_servidor_web.get("/api/estoque")
+async def consultar_estoque():
+    """Retorna o estoque atual de todos os produtos/variants da Shopify."""
+    if not TOKEN_SHOPIFY or not NOME_DA_LOJA_SHOPIFY:
+        raise HTTPException(status_code=503, detail="Credenciais Shopify não configuradas.")
+
+    produtos = await _buscar_produtos_shopify_paginado()
+    estoque = _montar_estoque_de_produtos(produtos)
+
+    total_skus = len(estoque)
+    total_unidades = sum(i["inventory_quantity"] for i in estoque)
+
+    logger_telemetria.info(f"[Estoque] Consulta concluída: {total_skus} SKUs, {total_unidades} unidades totais.")
+    return {
+        "status": "sucesso",
+        "total_skus": total_skus,
+        "total_unidades": total_unidades,
+        "itens": estoque,
+    }
+
+
+@app_servidor_web.post("/webhook-shopify/estoque-atualizado")
+async def webhook_shopify_estoque_atualizado(data: Dict[str, Any]):
+    """
+    Recebe o webhook inventory_levels/update da Shopify.
+    Payload esperado: { inventory_item_id, location_id, available, updated_at }
+    """
+    inventory_item_id = str(data.get("inventory_item_id") or "")
+    location_id = str(data.get("location_id") or "")
+    available = data.get("available")
+    updated_at = data.get("updated_at")
+
+    if not inventory_item_id:
+        return {"status": "ignorado", "motivo": "inventory_item_id ausente"}
+
+    logger_telemetria.info(
+        f"[Estoque] Webhook recebido — item={inventory_item_id} location={location_id} disponivel={available}"
+    )
+
+    if cliente_banco_supabase:
+        try:
+            row = {
+                "inventory_item_id": inventory_item_id,
+                "location_id": location_id,
+                "available": available,
+                "shopify_updated_at": updated_at,
+                "payload_shopify": data,
+            }
+            cliente_banco_supabase.table("estoque_shopify").upsert(
+                row, on_conflict="inventory_item_id,location_id"
+            ).execute()
+            logger_telemetria.info(f"[Estoque] Salvo no Supabase: item={inventory_item_id}")
+        except Exception as e:
+            logger_telemetria.error(f"[Estoque] Erro ao salvar no Supabase: {e}")
+
+    return {"status": "ok", "inventory_item_id": inventory_item_id, "available": available}
+
+
+# ---------------------------
+# PEDIDO: CANCELAMENTO
+# ---------------------------
+
+@app_servidor_web.post("/webhook-shopify/pedido-cancelado")
+async def webhook_shopify_pedido_cancelado(data: Dict[str, Any]):
+    """Recebe orders/cancelled da Shopify."""
+    order_id = str(data.get("id") or "")
+    numero = data.get("name")
+    cancel_reason = data.get("cancel_reason")
+
+    logger_telemetria.info(f"[Pedido] Cancelado: {numero} (id={order_id}) motivo={cancel_reason}")
+
+    if cliente_banco_supabase and order_id:
+        try:
+            cliente_banco_supabase.table("vendas").update({
+                "financial_status": "CANCELLED",
+                "fulfillment_status": "CANCELLED",
+                "status_pagamento": "CANCELADO",
+            }).eq("shopify_order_id", order_id).execute()
+        except Exception as e:
+            logger_telemetria.error(f"[Pedido] Erro ao cancelar no Supabase: {e}")
+
+    return {"status": "ok", "pedido": numero, "motivo": cancel_reason}
+
+
+# ---------------------------
+# REEMBOLSO
+# ---------------------------
+
+@app_servidor_web.post("/webhook-shopify/reembolso-criado")
+async def webhook_shopify_reembolso_criado(data: Dict[str, Any]):
+    """Recebe refunds/create da Shopify."""
+    order_id = str(data.get("order_id") or "")
+    refund_id = str(data.get("id") or "")
+    created_at = data.get("created_at")
+
+    logger_telemetria.info(f"[Reembolso] Criado: refund_id={refund_id} order_id={order_id}")
+
+    if cliente_banco_supabase and order_id:
+        try:
+            cliente_banco_supabase.table("reembolsos").upsert({
+                "shopify_refund_id": refund_id,
+                "shopify_order_id": order_id,
+                "created_at": created_at,
+                "payload_shopify": data,
+            }, on_conflict="shopify_refund_id").execute()
+        except Exception as e:
+            logger_telemetria.error(f"[Reembolso] Erro ao salvar no Supabase: {e}")
+
+    return {"status": "ok", "refund_id": refund_id, "order_id": order_id}
+
+
+# ---------------------------
+# PRODUTOS
+# ---------------------------
+
+def _extrair_produto(data: Dict[str, Any]) -> dict:
+    return {
+        "shopify_product_id": str(data.get("id") or ""),
+        "titulo": data.get("title"),
+        "status": data.get("status"),
+        "vendor": data.get("vendor"),
+        "product_type": data.get("product_type"),
+        "shopify_updated_at": data.get("updated_at"),
+        "payload_shopify": data,
+    }
+
+
+@app_servidor_web.post("/webhook-shopify/produto-criado")
+async def webhook_shopify_produto_criado(data: Dict[str, Any]):
+    """Recebe products/create da Shopify."""
+    product_id = str(data.get("id") or "")
+    logger_telemetria.info(f"[Produto] Criado: {data.get('title')} (id={product_id})")
+
+    if cliente_banco_supabase and product_id:
+        try:
+            cliente_banco_supabase.table("produtos_shopify").upsert(
+                _extrair_produto(data), on_conflict="shopify_product_id"
+            ).execute()
+        except Exception as e:
+            logger_telemetria.error(f"[Produto] Erro ao salvar no Supabase: {e}")
+
+    return {"status": "ok", "product_id": product_id}
+
+
+@app_servidor_web.post("/webhook-shopify/produto-atualizado")
+async def webhook_shopify_produto_atualizado(data: Dict[str, Any]):
+    """Recebe products/update da Shopify."""
+    product_id = str(data.get("id") or "")
+    logger_telemetria.info(f"[Produto] Atualizado: {data.get('title')} (id={product_id})")
+
+    if cliente_banco_supabase and product_id:
+        try:
+            cliente_banco_supabase.table("produtos_shopify").upsert(
+                _extrair_produto(data), on_conflict="shopify_product_id"
+            ).execute()
+        except Exception as e:
+            logger_telemetria.error(f"[Produto] Erro ao salvar no Supabase: {e}")
+
+    return {"status": "ok", "product_id": product_id}
+
+
+@app_servidor_web.post("/webhook-shopify/produto-deletado")
+async def webhook_shopify_produto_deletado(data: Dict[str, Any]):
+    """Recebe products/delete da Shopify."""
+    product_id = str(data.get("id") or "")
+    logger_telemetria.info(f"[Produto] Deletado: id={product_id}")
+
+    if cliente_banco_supabase and product_id:
+        try:
+            cliente_banco_supabase.table("produtos_shopify").delete().eq(
+                "shopify_product_id", product_id
+            ).execute()
+        except Exception as e:
+            logger_telemetria.error(f"[Produto] Erro ao deletar no Supabase: {e}")
+
+    return {"status": "ok", "product_id": product_id}
