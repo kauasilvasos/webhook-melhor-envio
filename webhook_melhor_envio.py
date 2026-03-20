@@ -1407,6 +1407,77 @@ async def webhook_shopify_produto_atualizado(data: Dict[str, Any]):
     return {"status": "ok", "product_id": product_id}
 
 
+@app_servidor_web.get("/admin/sincronizar-produtos-estoque")
+async def sincronizar_produtos_e_estoque():
+    """
+    Importação inicial: busca todos os produtos da Shopify, salva em produtos_shopify
+    e busca os níveis de estoque, salvando em estoque_shopify.
+    Chame este endpoint uma vez para popular as tabelas.
+    """
+    if not TOKEN_SHOPIFY or not NOME_DA_LOJA_SHOPIFY:
+        raise HTTPException(status_code=503, detail="Credenciais Shopify não configuradas.")
+    if not cliente_banco_supabase:
+        raise HTTPException(status_code=503, detail="Supabase não configurado.")
+
+    headers = {"X-Shopify-Access-Token": TOKEN_SHOPIFY, "Content-Type": "application/json"}
+
+    # 1) Busca todos os produtos e salva em produtos_shopify
+    produtos = await _buscar_produtos_shopify_paginado()
+    logger_telemetria.info(f"[Sync] {len(produtos)} produtos encontrados na Shopify.")
+
+    rows_produtos = [_extrair_produto(p) for p in produtos if p.get("id")]
+    if rows_produtos:
+        cliente_banco_supabase.table("produtos_shopify").upsert(
+            rows_produtos, on_conflict="shopify_product_id"
+        ).execute()
+    logger_telemetria.info(f"[Sync] {len(rows_produtos)} produtos salvos em produtos_shopify.")
+
+    # 2) Coleta todos os inventory_item_ids dos variants
+    all_item_ids = []
+    for produto in produtos:
+        for variant in produto.get("variants", []):
+            iid = variant.get("inventory_item_id")
+            if iid:
+                all_item_ids.append(str(iid))
+
+    # 3) Busca inventory_levels em lotes de 50 (limite da API Shopify)
+    rows_estoque = []
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        for i in range(0, len(all_item_ids), 50):
+            batch = all_item_ids[i:i + 50]
+            ids_param = ",".join(batch)
+            url = (
+                f"https://{NOME_DA_LOJA_SHOPIFY}.myshopify.com"
+                f"/admin/api/2024-01/inventory_levels.json"
+                f"?inventory_item_ids={ids_param}&limit=250"
+            )
+            resp = await client.get(url, headers=headers)
+            if resp.status_code != 200:
+                logger_telemetria.error(f"[Sync] Erro inventory_levels: {resp.status_code} {resp.text}")
+                continue
+            levels = resp.json().get("inventory_levels", [])
+            for lv in levels:
+                rows_estoque.append({
+                    "inventory_item_id": str(lv.get("inventory_item_id")),
+                    "location_id": str(lv.get("location_id")),
+                    "available": lv.get("available"),
+                    "shopify_updated_at": lv.get("updated_at"),
+                    "payload_shopify": lv,
+                })
+
+    if rows_estoque:
+        cliente_banco_supabase.table("estoque_shopify").upsert(
+            rows_estoque, on_conflict="inventory_item_id,location_id"
+        ).execute()
+    logger_telemetria.info(f"[Sync] {len(rows_estoque)} registros de estoque salvos em estoque_shopify.")
+
+    return {
+        "status": "sucesso",
+        "produtos_salvos": len(rows_produtos),
+        "estoque_salvo": len(rows_estoque),
+    }
+
+
 @app_servidor_web.post("/webhook-shopify/produto-deletado")
 async def webhook_shopify_produto_deletado(data: Dict[str, Any]):
     """Recebe products/delete da Shopify."""
