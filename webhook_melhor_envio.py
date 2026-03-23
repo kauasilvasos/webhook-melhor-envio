@@ -1362,18 +1362,21 @@ async def movimentar_estoque(body: MovimentarEstoqueRequest):
     headers = {"X-Shopify-Access-Token": token, "Content-Type": "application/json"}
     base_url = f"https://{NOME_DA_LOJA_SHOPIFY}.myshopify.com/admin/api/2024-01"
 
-    # 1) Busca location_id da primeira localização ativa
+    # 1) Busca location_id via inventory_levels do próprio item (não requer read_locations)
     async with httpx.AsyncClient(timeout=15.0) as client:
-        resp_loc = await client.get(f"{base_url}/locations.json", headers=headers)
+        resp_loc = await client.get(
+            f"{base_url}/inventory_levels.json?inventory_item_ids={body.inventory_item_id}",
+            headers=headers,
+        )
 
     if resp_loc.status_code != 200:
-        raise HTTPException(status_code=502, detail=f"Erro ao buscar locations: {resp_loc.text}")
+        raise HTTPException(status_code=502, detail=f"Erro ao buscar inventory_levels: {resp_loc.text}")
 
-    locations = resp_loc.json().get("locations", [])
-    if not locations:
-        raise HTTPException(status_code=502, detail="Nenhuma location encontrada na Shopify.")
+    levels = resp_loc.json().get("inventory_levels", [])
+    if not levels:
+        raise HTTPException(status_code=502, detail="Nenhuma location encontrada para este item.")
 
-    location_id = locations[0]["id"]
+    location_id = levels[0]["location_id"]
 
     # 2) Chama o endpoint correto da Shopify
     async with httpx.AsyncClient(timeout=15.0) as client:
