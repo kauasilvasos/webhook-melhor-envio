@@ -731,6 +731,60 @@ app_servidor_web.add_middleware(
 
 TOKEN_SHOPIFY = os.getenv("TOKEN_SHOPIFY")
 NOME_DA_LOJA_SHOPIFY = os.getenv("NOME_DA_LOJA_SHOPIFY")
+
+# Cache do token Shopify com renovação automática a cada 12h
+_shopify_token_cache: Dict[str, Any] = {
+    "token": TOKEN_SHOPIFY,
+    "fetched_at": None,  # None = usa o TOKEN_SHOPIFY do env sem validade
+}
+_SHOPIFY_TOKEN_TTL_HORAS = 12
+
+async def _get_shopify_token() -> Optional[str]:
+    """Retorna um token válido. Renova via client_credentials se expirado (>12h) ou ausente."""
+    agora = datetime.utcnow()
+    cache = _shopify_token_cache
+
+    # Ainda válido?
+    if cache["token"] and cache["fetched_at"]:
+        idade = (agora - cache["fetched_at"]).total_seconds() / 3600
+        if idade < _SHOPIFY_TOKEN_TTL_HORAS:
+            return cache["token"]
+
+    # TOKEN_SHOPIFY do env sem data de busca — usa sem forçar renovação
+    if cache["token"] and cache["fetched_at"] is None:
+        return cache["token"]
+
+    return await _renovar_token_shopify()
+
+async def _renovar_token_shopify() -> Optional[str]:
+    """Busca novo access_token via client_credentials e atualiza o cache."""
+    client_id = os.getenv("SHOPIFY_CLIENT_ID")
+    client_secret = os.getenv("SHOPIFY_CLIENT_SECRET")
+    shop = NOME_DA_LOJA_SHOPIFY
+
+    if not client_id or not client_secret or not shop:
+        logger_telemetria.warning("[Token] SHOPIFY_CLIENT_ID/SECRET ou NOME_DA_LOJA_SHOPIFY não configurados.")
+        return _shopify_token_cache.get("token")
+
+    url = f"https://{shop}.myshopify.com/admin/oauth/access_token"
+    payload = {"client_id": client_id, "client_secret": client_secret, "grant_type": "client_credentials"}
+
+    try:
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            resp = await client.post(url, json=payload)
+        dados = resp.json()
+        token = dados.get("access_token")
+        if token:
+            _shopify_token_cache["token"] = token
+            _shopify_token_cache["fetched_at"] = datetime.utcnow()
+            logger_telemetria.info("[Token] Token Shopify renovado com sucesso.")
+            return token
+        else:
+            logger_telemetria.error(f"[Token] Falha ao renovar token: {dados}")
+    except Exception as e:
+        logger_telemetria.error(f"[Token] Exceção ao renovar token: {e}")
+
+    return _shopify_token_cache.get("token")
 TOKEN_API_MELHOR_ENVIO = os.getenv("TOKEN_API_MELHOR_ENVIO")
 
 # --- CACHE SIMPLES (em memória). Em produção troque por Redis.
@@ -1202,30 +1256,49 @@ async def retroalimentar_banco_de_dados_supabase():
 # ---------------------------
 
 async def _buscar_produtos_shopify_paginado() -> List[dict]:
-    """Busca todos os produtos com variants e inventory_quantity via paginação de cursor."""
-    headers = {"X-Shopify-Access-Token": TOKEN_SHOPIFY, "Content-Type": "application/json"}
-    produtos = []
-    url = f"https://{NOME_DA_LOJA_SHOPIFY}.myshopify.com/admin/api/2024-01/products.json?limit=250&fields=id,title,variants,status"
+    """Busca todos os produtos com variants e inventory_quantity via paginação de cursor.
+    Renova o token automaticamente em caso de 401 ou lista vazia."""
+    for tentativa in range(2):
+        token = await _get_shopify_token()
+        if not token:
+            logger_telemetria.error("[Estoque] Token Shopify indisponível.")
+            return []
 
-    async with httpx.AsyncClient(timeout=30.0) as client:
-        while url:
-            resp = await client.get(url, headers=headers)
-            if resp.status_code != 200:
-                logger_telemetria.error(f"[Estoque] Erro ao buscar produtos: {resp.status_code} {resp.text}")
-                break
-            data = resp.json()
-            produtos.extend(data.get("products", []))
+        headers = {"X-Shopify-Access-Token": token, "Content-Type": "application/json"}
+        produtos = []
+        url = f"https://{NOME_DA_LOJA_SHOPIFY}.myshopify.com/admin/api/2024-01/products.json?limit=250&fields=id,title,variants,status"
+        erro_401 = False
 
-            # paginação via Link header
-            link_header = resp.headers.get("Link", "")
-            next_url = None
-            for part in link_header.split(","):
-                if 'rel="next"' in part:
-                    next_url = part.strip().split(";")[0].strip().strip("<>")
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            while url:
+                resp = await client.get(url, headers=headers)
+                if resp.status_code == 401:
+                    logger_telemetria.warning(f"[Estoque] 401 na tentativa {tentativa + 1}. Renovando token...")
+                    erro_401 = True
                     break
-            url = next_url
+                if resp.status_code != 200:
+                    logger_telemetria.error(f"[Estoque] Erro ao buscar produtos: {resp.status_code} {resp.text}")
+                    break
+                data = resp.json()
+                produtos.extend(data.get("products", []))
 
-    return produtos
+                # paginação via Link header
+                link_header = resp.headers.get("Link", "")
+                next_url = None
+                for part in link_header.split(","):
+                    if 'rel="next"' in part:
+                        next_url = part.strip().split(";")[0].strip().strip("<>")
+                        break
+                url = next_url
+
+        if erro_401 or (tentativa == 0 and len(produtos) == 0):
+            # Força renovação antes da próxima tentativa
+            await _renovar_token_shopify()
+            continue
+
+        return produtos
+
+    return []
 
 
 def _montar_estoque_de_produtos(produtos: List[dict]) -> List[dict]:
