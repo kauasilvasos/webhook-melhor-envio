@@ -1322,8 +1322,11 @@ def _montar_estoque_de_produtos(produtos: List[dict]) -> List[dict]:
 @app_servidor_web.get("/api/estoque")
 async def consultar_estoque():
     """Retorna o estoque atual de todos os produtos/variants da Shopify."""
-    if not TOKEN_SHOPIFY or not NOME_DA_LOJA_SHOPIFY:
-        raise HTTPException(status_code=503, detail="Credenciais Shopify não configuradas.")
+    if not NOME_DA_LOJA_SHOPIFY:
+        raise HTTPException(status_code=503, detail="NOME_DA_LOJA_SHOPIFY não configurado.")
+    token = await _get_shopify_token()
+    if not token:
+        raise HTTPException(status_code=503, detail="Token Shopify indisponível — verifique SHOPIFY_CLIENT_ID/SECRET.")
 
     produtos = await _buscar_produtos_shopify_paginado()
     estoque = _montar_estoque_de_produtos(produtos)
