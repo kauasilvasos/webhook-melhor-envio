@@ -1343,6 +1343,62 @@ async def consultar_estoque():
     }
 
 
+class MovimentarEstoqueRequest(BaseModel):
+    inventory_item_id: str
+    tipo: str  # 'ajuste' | 'entrada'
+    quantidade: int
+    observacao: Optional[str] = None
+
+@app_servidor_web.post("/api/estoque/movimentar")
+async def movimentar_estoque(body: MovimentarEstoqueRequest):
+    """Ajusta (total absoluto) ou dá entrada (adiciona) no estoque de um item Shopify."""
+    if not NOME_DA_LOJA_SHOPIFY:
+        raise HTTPException(status_code=503, detail="NOME_DA_LOJA_SHOPIFY não configurado.")
+
+    token = await _get_shopify_token()
+    if not token:
+        raise HTTPException(status_code=503, detail="Token Shopify indisponível.")
+
+    headers = {"X-Shopify-Access-Token": token, "Content-Type": "application/json"}
+    base_url = f"https://{NOME_DA_LOJA_SHOPIFY}.myshopify.com/admin/api/2024-01"
+
+    # 1) Busca location_id da primeira localização ativa
+    async with httpx.AsyncClient(timeout=15.0) as client:
+        resp_loc = await client.get(f"{base_url}/locations.json", headers=headers)
+
+    if resp_loc.status_code != 200:
+        raise HTTPException(status_code=502, detail=f"Erro ao buscar locations: {resp_loc.text}")
+
+    locations = resp_loc.json().get("locations", [])
+    if not locations:
+        raise HTTPException(status_code=502, detail="Nenhuma location encontrada na Shopify.")
+
+    location_id = locations[0]["id"]
+
+    # 2) Chama o endpoint correto da Shopify
+    async with httpx.AsyncClient(timeout=15.0) as client:
+        if body.tipo == "ajuste":
+            resp = await client.post(
+                f"{base_url}/inventory_levels/set.json",
+                headers=headers,
+                json={"location_id": location_id, "inventory_item_id": body.inventory_item_id, "available": body.quantidade},
+            )
+        else:  # entrada
+            resp = await client.post(
+                f"{base_url}/inventory_levels/adjust.json",
+                headers=headers,
+                json={"location_id": location_id, "inventory_item_id": body.inventory_item_id, "available_adjustment": body.quantidade},
+            )
+
+    if resp.status_code not in (200, 201):
+        raise HTTPException(status_code=resp.status_code, detail=f"Shopify: {resp.text}")
+
+    novo_estoque = resp.json().get("inventory_level", {}).get("available", body.quantidade)
+    logger_telemetria.info(f"[Estoque] {body.tipo} item={body.inventory_item_id} qty={body.quantidade} → {novo_estoque}")
+
+    return {"novoEstoque": novo_estoque}
+
+
 @app_servidor_web.post("/webhook-shopify/estoque-atualizado")
 async def webhook_shopify_estoque_atualizado(data: Dict[str, Any]):
     """
