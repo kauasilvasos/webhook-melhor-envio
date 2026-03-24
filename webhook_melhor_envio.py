@@ -259,7 +259,7 @@ load_dotenv()
 DB_VENDAS_KITS = []
 app_servidor_web = FastAPI()
 
-ALLOWED_ORIGINS = os.getenv("CORS_ALLOW_ORIGINS", "*").split(",")  
+ALLOWED_ORIGINS = [o.strip() for o in os.getenv("CORS_ALLOW_ORIGINS", "*").split(",")]
 
 class ItemKit(BaseModel):
     unidade: str
@@ -724,7 +724,7 @@ async def painel_admin_pedidos():
 app_servidor_web.add_middleware(
     CORSMiddleware,
     allow_origins=ALLOWED_ORIGINS,
-    allow_credentials=ALLOWED_ORIGINS != ["*"],  # credentials=True só com origens específicas
+    allow_credentials=False,
     allow_methods=["GET", "POST", "OPTIONS"],
     allow_headers=["*"],
 )
