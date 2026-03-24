@@ -1399,6 +1399,18 @@ async def movimentar_estoque(body: MovimentarEstoqueRequest):
     novo_estoque = resp.json().get("inventory_level", {}).get("available", body.quantidade)
     logger_telemetria.info(f"[Estoque] {body.tipo} item={body.inventory_item_id} qty={body.quantidade} → {novo_estoque}")
 
+    # Salva movimentação no Supabase (usando service key do backend)
+    if cliente_banco_supabase:
+        try:
+            cliente_banco_supabase.table("movimentacoes_estoque").insert({
+                "produto_id": body.inventory_item_id,
+                "tipo": body.tipo,
+                "quantidade": body.quantidade,
+                "observacao": body.observacao,
+            }).execute()
+        except Exception as e:
+            logger_telemetria.error(f"[Estoque] Erro ao salvar movimentação no Supabase: {e}")
+
     return {"novoEstoque": novo_estoque}
 
 
