@@ -1266,7 +1266,7 @@ async def _buscar_produtos_shopify_paginado() -> List[dict]:
 
         headers = {"X-Shopify-Access-Token": token, "Content-Type": "application/json"}
         produtos = []
-        url = f"https://{NOME_DA_LOJA_SHOPIFY}.myshopify.com/admin/api/2024-01/products.json?limit=250&fields=id,title,variants,status"
+        url = f"https://{NOME_DA_LOJA_SHOPIFY}.myshopify.com/admin/api/2024-01/products.json?limit=250&fields=id,title,variants,status,image"
         erro_401 = False
 
         async with httpx.AsyncClient(timeout=30.0) as client:
@@ -1315,6 +1315,7 @@ def _montar_estoque_de_produtos(produtos: List[dict]) -> List[dict]:
                 "inventory_item_id": str(variant.get("inventory_item_id")),
                 "inventory_quantity": variant.get("inventory_quantity", 0),
                 "status_produto": produto.get("status"),
+                "imagem_url": (produto.get("image") or {}).get("src"),
             })
     return resultado
 
