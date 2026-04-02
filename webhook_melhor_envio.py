@@ -1747,4 +1747,21 @@ async def llm_chat_completions(request: Request):
     body = await request.json()
     return await _llm_call("POST", "/chat/completions", body, timeout=120.0)
 
-    return {"status": "ok", "product_id": product_id}
+
+@app_servidor_web.api_route("/llm/v1/{path:path}", methods=["GET", "POST", "PUT", "DELETE"])
+async def llm_v1_proxy(path: str, request: Request):
+    """
+    Proxy transparente para o LiteLLM na máquina local.
+    Permite usar ANTHROPIC_BASE_URL=https://webhook-melhor-envio.onrender.com/llm
+    no Claude Code ou qualquer app OpenAI-compatible.
+    """
+    body: dict = {}
+    if request.method in ("POST", "PUT"):
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+
+    result = await _llm_call(request.method, f"/v1/{path}", body, timeout=120.0)
+    from fastapi.responses import JSONResponse
+    return JSONResponse(result)
