@@ -1,6 +1,7 @@
 fastapi
-uvicorn
-pydantic
+uvicorn[standard]
+pydantic>=2.11.7
 python-dotenv
 httpx
 supabase
+websockets

@@ -1,13 +1,16 @@
+import asyncio
+import json
 import logging
+import uuid
 import httpx
 import os
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect, Request
 from pydantic import BaseModel
 from typing import Optional, Dict, Any
 from dotenv import load_dotenv
 from fastapi.middleware.cors import CORSMiddleware
 from datetime import datetime, timedelta
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, JSONResponse
 from typing import List
 from urllib.parse import urlparse, parse_qs
 from datetime import datetime
@@ -1639,5 +1642,109 @@ async def webhook_shopify_produto_deletado(data: Dict[str, Any]):
             ).execute()
         except Exception as e:
             logger_telemetria.error(f"[Produto] Erro ao deletar no Supabase: {e}")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# LLM RELAY — túnel WebSocket para a máquina local com OpenLLM
+# ─────────────────────────────────────────────────────────────────────────────
+
+_llm_local_ws: Optional[WebSocket] = None
+_llm_pending: dict[str, asyncio.Future] = {}
+
+
+@app_servidor_web.websocket("/ws/local")
+async def llm_local_tunnel(websocket: WebSocket):
+    """Máquina local conecta aqui e mantém o túnel aberto."""
+    global _llm_local_ws
+    await websocket.accept()
+    _llm_local_ws = websocket
+    logger_telemetria.info("[LLM] Máquina local conectada ao relay")
+    try:
+        while True:
+            raw = await websocket.receive_text()
+            msg = json.loads(raw)
+            req_id = msg.get("request_id")
+            if req_id and req_id in _llm_pending:
+                fut = _llm_pending[req_id]
+                if not fut.done():
+                    fut.set_result(msg)
+    except WebSocketDisconnect:
+        _llm_local_ws = None
+        logger_telemetria.info("[LLM] Máquina local desconectada")
+
+
+async def _llm_call(method: str, path: str, body: dict | None = None, timeout: float = 90.0) -> dict:
+    if _llm_local_ws is None:
+        raise HTTPException(503, detail="Máquina local não conectada")
+
+    req_id = str(uuid.uuid4())
+    loop = asyncio.get_event_loop()
+    fut: asyncio.Future = loop.create_future()
+    _llm_pending[req_id] = fut
+
+    await _llm_local_ws.send_text(json.dumps({
+        "request_id": req_id,
+        "method": method,
+        "path": path,
+        "body": body or {},
+    }))
+
+    try:
+        result = await asyncio.wait_for(fut, timeout=timeout)
+        return result.get("data", {})
+    except asyncio.TimeoutError:
+        raise HTTPException(504, detail="Máquina local não respondeu a tempo")
+    finally:
+        _llm_pending.pop(req_id, None)
+
+
+# ── Endpoints públicos do LLM ─────────────────────────────────────────────────
+
+@app_servidor_web.get("/llm/health")
+async def llm_health():
+    return {"relay": "ok", "local_conectado": _llm_local_ws is not None}
+
+
+@app_servidor_web.get("/llm/status")
+async def llm_status():
+    return await _llm_call("GET", "/status")
+
+
+@app_servidor_web.get("/llm/models")
+async def llm_list_models():
+    return await _llm_call("GET", "/models")
+
+
+@app_servidor_web.get("/llm/models/active")
+async def llm_active_model():
+    return await _llm_call("GET", "/models/active")
+
+
+@app_servidor_web.post("/llm/models/{model_id}/start")
+async def llm_start_model(model_id: str, request: Request):
+    body = await request.json() if request.headers.get("content-length", "0") != "0" else {}
+    return await _llm_call("POST", f"/models/{model_id}/start", body, timeout=120.0)
+
+
+@app_servidor_web.post("/llm/models/{model_id}/stop")
+async def llm_stop_model(model_id: str):
+    return await _llm_call("POST", f"/models/{model_id}/stop")
+
+
+@app_servidor_web.post("/llm/models/switch")
+async def llm_switch_model(request: Request):
+    body = await request.json()
+    return await _llm_call("POST", "/models/switch", body, timeout=120.0)
+
+
+@app_servidor_web.get("/llm/logs")
+async def llm_logs(lines: int = 50):
+    return await _llm_call("GET", f"/logs?lines={lines}")
+
+
+@app_servidor_web.post("/llm/chat/completions")
+async def llm_chat_completions(request: Request):
+    body = await request.json()
+    return await _llm_call("POST", "/chat/completions", body, timeout=120.0)
 
     return {"status": "ok", "product_id": product_id}
