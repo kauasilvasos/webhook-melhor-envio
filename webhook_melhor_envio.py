@@ -4,6 +4,8 @@ import logging
 import uuid
 import httpx
 import os
+import time
+from contextlib import asynccontextmanager
 from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect, Request
 from pydantic import BaseModel
 from typing import Optional, Dict, Any
@@ -15,6 +17,8 @@ from typing import List
 from urllib.parse import urlparse, parse_qs
 from datetime import datetime
 from supabase import create_client, Client
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from apscheduler.triggers.cron import CronTrigger
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger_telemetria = logging.getLogger("middleware_rastreio")
@@ -260,7 +264,148 @@ def extrair_utm_campaign(url: Optional[str]) -> Optional[str]:
         return None
 load_dotenv()
 DB_VENDAS_KITS = []
-app_servidor_web = FastAPI()
+
+# ── Yampi sync ────────────────────────────────────────────────────────────────
+
+YAMPI_USER_TOKEN  = os.getenv("YAMPI_USER_TOKEN", "")
+YAMPI_USER_SECRET = os.getenv("YAMPI_USER_SECRET", "")
+YAMPI_ALIAS       = os.getenv("YAMPI_ALIAS", "")
+_logger_yampi     = logging.getLogger("yampi_sync")
+
+def sync_yampi_orders(dias: int = 15) -> dict:
+    """Busca pedidos da API Yampi e faz upsert em pedidos_yampi no Supabase."""
+    if not (YAMPI_USER_TOKEN and YAMPI_USER_SECRET and YAMPI_ALIAS):
+        _logger_yampi.warning("Credenciais Yampi não configuradas — pulando sync")
+        return {"status": "skip", "motivo": "credenciais ausentes"}
+    if not cliente_banco_supabase:
+        _logger_yampi.warning("Supabase não configurado — pulando sync")
+        return {"status": "skip", "motivo": "supabase ausente"}
+
+    headers = {
+        "User-Token": YAMPI_USER_TOKEN,
+        "User-Secret-key": YAMPI_USER_SECRET,
+        "Content-Type": "application/json",
+    }
+    data_limite = (datetime.now() - timedelta(days=dias)).strftime("%Y-%m-%d")
+    url_base    = f"https://api.dooki.com.br/v2/{YAMPI_ALIAS}/orders"
+
+    all_rows: list[dict] = []
+    page = 1
+
+    while True:
+        try:
+            resp = httpx.get(f"{url_base}?page={page}", headers=headers, timeout=30)
+            resp.raise_for_status()
+            json_data = resp.json()
+        except Exception as e:
+            _logger_yampi.error("Erro na página %d: %s", page, e)
+            break
+
+        orders = json_data.get("data", [])
+        if not orders:
+            break
+
+        for idx, order in enumerate(orders):
+            data_criacao = (order.get("created_at") or {}).get("date", "")
+            if data_criacao and str(data_criacao)[:10] < data_limite:
+                continue
+
+            for i, item in enumerate(order.get("items", {}).get("data", [])):
+                sku_raw  = item.get("sku") or {}
+                sku_data = sku_raw.get("data", {}) if isinstance(sku_raw, dict) else {}
+                sku_id   = sku_data.get("id")
+
+                variacoes = " | ".join(
+                    v.get("value", "") for v in sku_data.get("variations", []) if v.get("value")
+                )
+                nome_produto = item.get("product_name", "")
+                produto_fmt  = f"{nome_produto} ({variacoes})" if variacoes else nome_produto
+
+                cupom = ""
+                promo = order.get("promocode")
+                if isinstance(promo, dict):
+                    info = promo.get("data")
+                    if isinstance(info, dict):
+                        cupom = info.get("code", "")
+                    elif isinstance(info, list) and info:
+                        cupom = info[0].get("code", "")
+
+                all_rows.append({
+                    "id_supabase":  f"{order.get('id')}_{sku_id}_{i}" if sku_id else f"{order.get('id')}_item_{i}",
+                    "id":           order.get("id"),
+                    "data":         data_criacao,
+                    "data_pagamento": (order.get("paid_at") or {}).get("date"),
+                    "numero_pedido": order.get("number"),
+                    "cliente":      (order.get("customer") or {}).get("data", {}).get("name"),
+                    "cliente_email": (order.get("customer") or {}).get("data", {}).get("email"),
+                    "status":       (order.get("status") or {}).get("data", {}).get("name"),
+                    "produto":      produto_fmt,
+                    "sku":          sku_data.get("sku"),
+                    "quantidade":   item.get("quantity"),
+                    "total":        order.get("total"),
+                    "total_item":   item.get("price"),
+                    "total_frete":  order.get("total_shipping"),
+                    "total_desconto": order.get("total_discount"),
+                    "cupom":        cupom,
+                    "codigo_rastreamento": order.get("tracking_code"),
+                    "url_rastreamento":    order.get("tracking_url"),
+                    "entrega_cidade": (order.get("shipping_address") or {}).get("data", {}).get("city"),
+                    "entrega_estado": (order.get("shipping_address") or {}).get("data", {}).get("state"),
+                    "entrega_cep":    (order.get("shipping_address") or {}).get("data", {}).get("zipcode"),
+                    "utm_source":   order.get("utm_source"),
+                    "utm_campaign": order.get("utm_campaign"),
+                })
+
+        pagination = json_data.get("meta", {}).get("pagination", {})
+        if page >= pagination.get("total_pages", 1):
+            break
+        page += 1
+        time.sleep(0.5)
+
+    if not all_rows:
+        _logger_yampi.info("Nenhum pedido encontrado nos últimos %d dias", dias)
+        return {"status": "ok", "total": 0}
+
+    # Deduplica por id_supabase
+    unique = list({r["id_supabase"]: r for r in all_rows}.values())
+
+    try:
+        cliente_banco_supabase.table("pedidos_yampi").upsert(
+            unique, on_conflict="id_supabase"
+        ).execute()
+        _logger_yampi.info("✅ %d registros sincronizados (Yampi → Supabase)", len(unique))
+        return {"status": "ok", "total": len(unique)}
+    except Exception as e:
+        _logger_yampi.error("Erro no upsert Supabase: %s", e)
+        return {"status": "erro", "motivo": str(e)}
+
+
+# ── Scheduler (APScheduler) ───────────────────────────────────────────────────
+
+_scheduler = AsyncIOScheduler(timezone="America/Sao_Paulo")
+
+def _job_sync_yampi():
+    _logger_yampi.info("⏰ Scheduler: iniciando sync Yampi")
+    result = sync_yampi_orders(dias=15)
+    _logger_yampi.info("⏰ Scheduler: sync finalizado — %s", result)
+
+
+@asynccontextmanager
+async def lifespan(app):
+    # Horário comercial: 8h, 11h, 14h, 17h, 20h (BRT)
+    for hora in [8, 11, 14, 17, 20]:
+        _scheduler.add_job(_job_sync_yampi, CronTrigger(hour=hora, minute=0, timezone="America/Sao_Paulo"))
+    # Madrugada: 1h e 6h (BRT)
+    for hora in [1, 6]:
+        _scheduler.add_job(_job_sync_yampi, CronTrigger(hour=hora, minute=0, timezone="America/Sao_Paulo"))
+
+    _scheduler.start()
+    _logger_yampi.info("🕐 Yampi scheduler iniciado (8h,11h,14h,17h,20h + 1h,6h BRT)")
+    yield
+    _scheduler.shutdown()
+
+
+app_servidor_web = FastAPI(lifespan=lifespan)
 
 ALLOWED_ORIGINS = [o.strip() for o in os.getenv("CORS_ALLOW_ORIGINS", "*").split(",")]
 
@@ -1150,6 +1295,13 @@ async def capturar_token_oauth(shop: str, code: str):
         else:
             logger_telemetria.error(f"Erro ao capturar token: {dados}")
             return {"status": "erro", "detalhes": dados}
+
+
+@app_servidor_web.post("/admin/sync-yampi")
+async def admin_sync_yampi(dias: int = 15):
+    """Dispara manualmente a sincronização de pedidos Yampi → Supabase."""
+    result = await asyncio.get_event_loop().run_in_executor(None, lambda: sync_yampi_orders(dias=dias))
+    return result
 
 
 @app_servidor_web.get("/admin/sincronizar-historico")
