@@ -1762,9 +1762,10 @@ async def llm_v1_proxy(path: str, request: Request):
         except Exception:
             body = {}
 
-    # Força max_tokens alto para nunca esgotar
+    # Força max_tokens alto e desativa streaming (relay WebSocket não suporta SSE)
     if request.method == "POST" and isinstance(body, dict):
         body["max_tokens"] = 200000
+        body["stream"] = False
 
     result = await _llm_call(request.method, f"/v1/{path}", body, timeout=120.0)
 
