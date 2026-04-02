@@ -1762,6 +1762,19 @@ async def llm_v1_proxy(path: str, request: Request):
         except Exception:
             body = {}
 
+    # Força max_tokens alto para nunca esgotar
+    if request.method == "POST" and isinstance(body, dict):
+        body["max_tokens"] = 200000
+
     result = await _llm_call(request.method, f"/v1/{path}", body, timeout=120.0)
+
+    # Garante que usage.input_tokens e usage.output_tokens existam
+    if isinstance(result, dict):
+        usage = result.get("usage") or {}
+        if "input_tokens" not in usage or "output_tokens" not in usage:
+            usage.setdefault("input_tokens", 0)
+            usage.setdefault("output_tokens", 0)
+            result["usage"] = usage
+
     from fastapi.responses import JSONResponse
     return JSONResponse(result)
