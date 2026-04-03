@@ -1810,23 +1810,30 @@ async def llm_local_tunnel(websocket: WebSocket):
     global _llm_local_ws
     await websocket.accept()
     _llm_local_ws = websocket
-    logger_telemetria.info("[LLM] Máquina local conectada ao relay")
+    logger_telemetria.info("[LLM-tunnel] Máquina local conectada ao relay")
     try:
         while True:
             raw = await websocket.receive_text()
             msg = json.loads(raw)
             req_id = msg.get("request_id")
+            logger_telemetria.debug("[LLM-tunnel] Resposta recebida da máquina local | request_id=%s | keys=%s", req_id, list(msg.keys()))
             if req_id and req_id in _llm_pending:
                 fut = _llm_pending[req_id]
                 if not fut.done():
+                    logger_telemetria.debug("[LLM-tunnel] Future resolvida | request_id=%s", req_id)
                     fut.set_result(msg)
+            else:
+                logger_telemetria.warning("[LLM-tunnel] request_id=%s não encontrado em pending (total pending=%d)", req_id, len(_llm_pending))
     except WebSocketDisconnect:
         _llm_local_ws = None
-        logger_telemetria.info("[LLM] Máquina local desconectada")
+        logger_telemetria.info("[LLM-tunnel] Máquina local desconectada")
 
 
 async def _llm_call(method: str, path: str, body: dict | None = None, timeout: float = 90.0) -> dict:
+    logger_telemetria.info("[LLM-relay] _llm_call | method=%s path=%s local_conectado=%s pending_count=%d", method, path, _llm_local_ws is not None, len(_llm_pending))
+
     if _llm_local_ws is None:
+        logger_telemetria.error("[LLM-relay] Máquina local NÃO conectada — retornando 503")
         raise HTTPException(503, detail="Máquina local não conectada")
 
     req_id = str(uuid.uuid4())
@@ -1834,17 +1841,17 @@ async def _llm_call(method: str, path: str, body: dict | None = None, timeout: f
     fut: asyncio.Future = loop.create_future()
     _llm_pending[req_id] = fut
 
-    await _llm_local_ws.send_text(json.dumps({
-        "request_id": req_id,
-        "method": method,
-        "path": path,
-        "body": body or {},
-    }))
+    payload = {"request_id": req_id, "method": method, "path": path, "body": body or {}}
+    logger_telemetria.debug("[LLM-relay] Enviando para local | request_id=%s | body_keys=%s", req_id, list((body or {}).keys()))
+    await _llm_local_ws.send_text(json.dumps(payload))
 
     try:
         result = await asyncio.wait_for(fut, timeout=timeout)
-        return result.get("data", {})
+        data = result.get("data", {})
+        logger_telemetria.info("[LLM-relay] Resposta recebida | request_id=%s | data_type=%s | data_keys=%s", req_id, type(data).__name__, list(data.keys()) if isinstance(data, dict) else "—")
+        return data
     except asyncio.TimeoutError:
+        logger_telemetria.error("[LLM-relay] TIMEOUT aguardando local | request_id=%s | timeout=%.1fs", req_id, timeout)
         raise HTTPException(504, detail="Máquina local não respondeu a tempo")
     finally:
         _llm_pending.pop(req_id, None)
@@ -1897,7 +1904,10 @@ async def llm_logs(lines: int = 50):
 @app_servidor_web.post("/llm/chat/completions")
 async def llm_chat_completions(request: Request):
     body = await request.json()
-    return await _llm_call("POST", "/chat/completions", body, timeout=120.0)
+    logger_telemetria.info("[LLM-chat] POST /llm/chat/completions | model=%s | messages_count=%d", body.get("model"), len(body.get("messages", [])))
+    result = await _llm_call("POST", "/chat/completions", body, timeout=120.0)
+    logger_telemetria.info("[LLM-chat] Resultado | keys=%s", list(result.keys()) if isinstance(result, dict) else type(result).__name__)
+    return result
 
 
 @app_servidor_web.api_route("/llm/v1/{path:path}", methods=["GET", "POST", "PUT", "DELETE"])
@@ -1914,12 +1924,19 @@ async def llm_v1_proxy(path: str, request: Request):
         except Exception:
             body = {}
 
+    logger_telemetria.info("[LLM-v1] %s /llm/v1/%s | model=%s | messages_count=%d | stream=%s",
+                           request.method, path, body.get("model"), len(body.get("messages", [])), body.get("stream"))
+
     # Força max_tokens alto e desativa streaming (relay WebSocket não suporta SSE)
     if request.method == "POST" and isinstance(body, dict):
         body["max_tokens"] = 200000
         body["stream"] = False
+        logger_telemetria.debug("[LLM-v1] stream forçado para False, max_tokens=200000")
 
     result = await _llm_call(request.method, f"/v1/{path}", body, timeout=120.0)
+
+    logger_telemetria.info("[LLM-v1] Resposta | path=%s | result_type=%s | keys=%s",
+                           path, type(result).__name__, list(result.keys()) if isinstance(result, dict) else "—")
 
     # Garante que usage.input_tokens e usage.output_tokens existam
     if isinstance(result, dict):
@@ -1928,6 +1945,10 @@ async def llm_v1_proxy(path: str, request: Request):
             usage.setdefault("input_tokens", 0)
             usage.setdefault("output_tokens", 0)
             result["usage"] = usage
+            logger_telemetria.debug("[LLM-v1] usage preenchido com zeros: %s", result["usage"])
+
+    if isinstance(result, dict) and "error" in result:
+        logger_telemetria.error("[LLM-v1] Erro na resposta: %s", result["error"])
 
     from fastapi.responses import JSONResponse
     return JSONResponse(result)
