@@ -1950,5 +1950,121 @@ async def llm_v1_proxy(path: str, request: Request):
     if isinstance(result, dict) and "error" in result:
         logger_telemetria.error("[LLM-v1] Erro na resposta: %s", result["error"])
 
+
+# ---------------------------
+# Rotas do Painel (Shopify)
+# ---------------------------
+
+async def _shopify_paginate(first_url: str, key: str) -> list:
+    """Pagina um endpoint Shopify e retorna todos os itens."""
+    token = await _get_shopify_token()
+    headers = {"X-Shopify-Access-Token": token or "", "Content-Type": "application/json"}
+    results = []
+    url = first_url
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        while url:
+            resp = await client.get(url, headers=headers)
+            if resp.status_code != 200:
+                raise HTTPException(status_code=resp.status_code, detail=f"Shopify {resp.status_code}: {resp.text[:200]}")
+            data = resp.json()
+            results.extend(data.get(key, []))
+            link = resp.headers.get("link", "")
+            import re
+            m = re.search(r'<([^>]+)>;\s*rel="next"', link)
+            url = m.group(1) if m else None
+    return results
+
+
+@app_servidor_web.get("/api/estoque")
+async def api_estoque():
+    """Retorna produtos e quantidades de estoque da Shopify."""
+    shop = NOME_DA_LOJA_SHOPIFY or "clinebrazil"
+    base = f"https://{shop}.myshopify.com/admin/api/2024-01"
+    products = await _shopify_paginate(
+        f"{base}/products.json?limit=250&fields=id,title,status,variants,images",
+        "products",
+    )
+    itens = []
+    for p in products:
+        for v in p.get("variants", []):
+            itens.append({
+                "produto_id":         str(p["id"]),
+                "produto_titulo":     p["title"],
+                "variant_titulo":     v.get("title", ""),
+                "sku":                v.get("sku", ""),
+                "inventory_item_id":  str(v.get("inventory_item_id", "")),
+                "inventory_quantity": v.get("inventory_quantity", 0),
+                "status_produto":     p.get("status", ""),
+                "imagem_url":         p["images"][0]["src"] if p.get("images") else None,
+            })
+    return JSONResponse({"itens": itens})
+
+
+@app_servidor_web.get("/api/analytics")
+async def api_analytics(dateFrom: str, dateTo: str):
+    """Retorna métricas de vendas da Shopify para o período informado."""
+    shop = NOME_DA_LOJA_SHOPIFY or "clinebrazil"
+    base = f"https://{shop}.myshopify.com/admin/api/2024-01"
+    params = (
+        f"status=any&limit=250"
+        f"&created_at_min={dateFrom}T00:00:00-03:00"
+        f"&created_at_max={dateTo}T23:59:59-03:00"
+        f"&fields=financial_status,cancelled_at,subtotal_price,total_discounts,"
+        f"total_price,total_tax,total_shipping_price_set,refunds,created_at"
+    )
+    orders = await _shopify_paginate(f"{base}/orders.json?{params}", "orders")
+
+    excl = {"cancelled", "voided"}
+    vendas_brutas = descontos = frete = tributos = total_vendas = 0.0
+    pedidos = 0
+    devolucoes = 0.0
+    daily_map: Dict[str, float] = {}
+
+    for o in orders:
+        if o.get("cancelled_at") or o.get("financial_status") in excl:
+            continue
+        subtotal = float(o.get("subtotal_price") or 0)
+        discount = float(o.get("total_discounts") or 0)
+        total    = float(o.get("total_price") or 0)
+        tax      = float(o.get("total_tax") or 0)
+        shipping = float((o.get("total_shipping_price_set") or {}).get("shop_money", {}).get("amount") or 0)
+
+        vendas_brutas += subtotal
+        descontos     += discount
+        frete         += shipping
+        tributos      += tax
+        total_vendas  += total
+        pedidos       += 1
+
+        for refund in o.get("refunds", []):
+            for item in refund.get("refund_line_items", []):
+                devolucoes += float(item.get("subtotal") or 0)
+
+        day = (o.get("created_at") or "")[:10]
+        if day:
+            daily_map[day] = daily_map.get(day, 0.0) + total
+
+    def r2(n: float) -> float:
+        return round(n * 100) / 100
+
+    daily_sales = [
+        {"date": d, "total": r2(v)}
+        for d, v in sorted(daily_map.items())
+    ]
+
+    return JSONResponse({
+        "vendas_brutas":   r2(vendas_brutas),
+        "descontos":       r2(descontos),
+        "devolucoes":      r2(devolucoes),
+        "vendas_liquidas": r2(vendas_brutas - descontos - devolucoes),
+        "frete":           r2(frete),
+        "tributos":        r2(tributos),
+        "total_vendas":    r2(total_vendas),
+        "pedidos":         pedidos,
+        "sessoes":         None,
+        "taxa_conversao":  None,
+        "daily_sales":     daily_sales,
+    })
+
     from fastapi.responses import JSONResponse
     return JSONResponse(result)
