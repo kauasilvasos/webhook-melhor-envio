@@ -449,9 +449,14 @@ async def webhook_shopify_pedido_criado(data: Dict[str, Any]):
                 venda["email_cliente"] = email
             if nome and (venda.get("nome_cliente") in [None, "", "Aguardando Pagamento..."]):
                 venda["nome_cliente"] = nome
-            return {"status": "ok", "kit_id": kit_id, "pedido": numero}
+            break
 
-    return {"status": "nao_encontrado", "kit_id": kit_id}
+    financial_status = (data.get("financial_status") or "").upper()
+    total_price = float(data.get("total_price") or 0)
+    pedido_gratuito = total_price == 0
+    supa_atualizar_kit_com_shopify(kit_id, numero, financial_status, total_price, pedido_gratuito, email, nome)
+    supa_upsert_venda_from_shopify(data)
+    return {"status": "ok", "kit_id": kit_id, "pedido": numero}
 
 
 @app_servidor_web.post("/webhook-shopify/pedido-pago")
@@ -465,9 +470,15 @@ async def webhook_shopify_pedido_pago(data: Dict[str, Any]):
         if (kit_id and venda.get("kit_id") == kit_id) or (numero and venda.get("numero_pedido_shopify") == numero) or (order_id and str(order_id) == str(venda.get("id_pedido_shopify"))):
             venda["status_pedido"] = "PEDIDO_APROVADO"
             venda["status_pagamento"] = "PAGO"
-            return {"status": "ok", "pedido": numero}
+            break
 
-    return {"status": "nao_encontrado", "pedido": numero}
+    supa_upsert_venda_from_shopify(data)
+    if kit_id and cliente_banco_supabase:
+        try:
+            cliente_banco_supabase.table("kit_selecoes").update({"status_pagamento": "PAGO"}).eq("kit_id", kit_id).execute()
+        except Exception as e:
+            logger_telemetria.error(f"[pedido-pago] Erro ao atualizar kit_selecoes: {e}")
+    return {"status": "ok", "pedido": numero}
 
 def supa_salvar_selecao_kit(payload: dict):
     """
@@ -523,6 +534,29 @@ def supa_atualizar_kit_com_yampi(kit_id: str, nome: str | None, email: str | Non
         cliente_banco_supabase.table("kit_selecoes").update(update).eq("kit_id", kit_id).execute()
     except Exception as e:
         logger_telemetria.error(f"[kit_selecoes] Erro ao atualizar com Yampi: {e}")
+
+
+def supa_atualizar_kit_com_shopify(kit_id: str, numero: str | None, financial_status: str,
+                                    total_price: float, pedido_gratuito: bool,
+                                    email: str | None, nome: str | None):
+    """Atualiza kit_selecoes com dados do pedido Shopify (número, status, total)."""
+    if not cliente_banco_supabase or not kit_id:
+        return
+    try:
+        status_pag = "GRÁTIS" if pedido_gratuito else ("PAGO" if financial_status in ["PAID", "AUTHORIZED"] else "PENDENTE")
+        update: dict = {
+            "numero_pedido_shopify": numero,
+            "total_price": total_price,
+            "pedido_gratuito": pedido_gratuito,
+            "status_pagamento": status_pag,
+        }
+        if email:
+            update["email_cliente"] = email
+        if nome:
+            update["nome_cliente"] = nome
+        cliente_banco_supabase.table("kit_selecoes").update(update).eq("kit_id", kit_id).execute()
+    except Exception as e:
+        logger_telemetria.error(f"[kit_selecoes] Erro ao atualizar com Shopify: {e}")
 
 
 @app_servidor_web.post("/Venda")
@@ -585,16 +619,20 @@ async def webhook_yampi(data: Dict[str, Any]):
                 break
 
         supa_atualizar_kit_com_yampi(kit_id, nome_real, email_real, telefone_real, cpf_real, data)
+        supa_update_venda_from_yampi(kit_id, nome_real, email_real, data)
 
     return {"status": "recebido", "kit_id_encontrado": kit_id}
 
 @app_servidor_web.post("/admin/vendas/alternar-enviado/{kit_id}")
 async def alternar_status_enviado(kit_id: str):
-    for venda in DB_VENDAS_KITS:
-        if venda["kit_id"] == kit_id:
-            venda["enviado"] = not venda.get("enviado", False)
-            return {"sucesso": True, "novo_status": venda["enviado"]}
-    raise HTTPException(status_code=404, detail="Kit não encontrado")
+    if not cliente_banco_supabase:
+        raise HTTPException(status_code=503, detail="Supabase não configurado")
+    res = cliente_banco_supabase.table("kit_selecoes").select("enviado").eq("kit_id", kit_id).limit(1).execute()
+    if not res.data:
+        raise HTTPException(status_code=404, detail="Kit não encontrado")
+    novo = not (res.data[0].get("enviado") or False)
+    cliente_banco_supabase.table("kit_selecoes").update({"enviado": novo}).eq("kit_id", kit_id).execute()
+    return {"sucesso": True, "novo_status": novo}
 
 @app_servidor_web.post("/webhook-shopify/pedido-atualizado")
 async def webhook_shopify_pedido_atualizado(data: Dict[str, Any]):
@@ -624,6 +662,7 @@ async def webhook_shopify_pedido_atualizado(data: Dict[str, Any]):
     discounts = float(data.get("total_discounts") or 0)
     financial_status = (data.get("financial_status") or "").upper()
 
+    pedido_gratuito = total_price == 0
     for venda in DB_VENDAS_KITS:
         if venda.get("kit_id") == kit_id:
             venda["status_pedido"] = "PEDIDO_CRIADO"
@@ -633,37 +672,54 @@ async def webhook_shopify_pedido_atualizado(data: Dict[str, Any]):
             venda["subtotal_price"] = subtotal_price
             venda["total_discounts"] = discounts
             venda["financial_status"] = financial_status
-
-            # marcar como gratuito
-            if total_price == 0:
-                venda["pedido_gratuito"] = True
-                venda["status_pagamento"] = "GRÁTIS"
-            else:
-                venda["pedido_gratuito"] = False
+            venda["pedido_gratuito"] = pedido_gratuito
             if email:
                 venda["email_cliente"] = email
             if nome and (venda.get("nome_cliente") in [None, "", "Aguardando Pagamento..."]):
                 venda["nome_cliente"] = nome
-
             if financial_status in ["PAID", "AUTHORIZED"]:
                 venda["status_pagamento"] = "PAGO"
                 venda["status_pedido"] = "PEDIDO_APROVADO"
+            break
 
-            return {"status": "ok", "kit_id": kit_id, "financial_status": financial_status}
-
-    return {"status": "nao_encontrado", "kit_id": kit_id}
+    supa_atualizar_kit_com_shopify(kit_id, numero, financial_status, total_price, pedido_gratuito, email, nome)
+    supa_upsert_venda_from_shopify(data)
+    return {"status": "ok", "kit_id": kit_id, "financial_status": financial_status}
 
 @app_servidor_web.post("/admin/vendas/alternar-status/{kit_id}")
 async def alternar_status_separacao(kit_id: str):
-    for venda in DB_VENDAS_KITS:
-        if venda["kit_id"] == kit_id:
-            venda["ja_foi_separado"] = not venda.get("ja_foi_separado", False)
-            return {"sucesso": True, "novo_status": venda["ja_foi_separado"]}
+    if not cliente_banco_supabase:
+        raise HTTPException(status_code=503, detail="Supabase não configurado")
+    res = cliente_banco_supabase.table("kit_selecoes").select("ja_foi_separado").eq("kit_id", kit_id).limit(1).execute()
+    if not res.data:
+        raise HTTPException(status_code=404, detail="Kit não encontrado")
+    novo = not (res.data[0].get("ja_foi_separado") or False)
+    cliente_banco_supabase.table("kit_selecoes").update({"ja_foi_separado": novo}).eq("kit_id", kit_id).execute()
+    return {"sucesso": True, "novo_status": novo}
     raise HTTPException(status_code=404, detail="Kit não encontrado")
 
 # 4. TELA DE ADMIN COM CHECKLIST
 @app_servidor_web.get("/admin/vendas", response_class=HTMLResponse)
 async def painel_admin_vendas():
+    # Lê do Supabase para não perder dados quando o servidor reiniciar
+    vendas = []
+    erro_supabase = None
+    if cliente_banco_supabase:
+        try:
+            res = (
+                cliente_banco_supabase
+                .table("kit_selecoes")
+                .select("*")
+                .order("created_at", desc=True)
+                .limit(300)
+                .execute()
+            )
+            vendas = res.data or []
+        except Exception as e:
+            erro_supabase = str(e)
+    else:
+        erro_supabase = "Supabase não configurado (variáveis SUPABASE_URL / SUPABASE_KEY ausentes)."
+
     html_content = """
     <html>
         <head>
@@ -677,6 +733,7 @@ async def painel_admin_vendas():
                 .detalhes { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 10px; margin-top: 15px; background: #f9f9f9; padding: 10px; border-radius: 8px; }
                 .item-badge { background: #eee; padding: 5px 10px; border-radius: 4px; font-size: 0.9em; }
                 .checkbox-custom { width: 25px; height: 25px; cursor: pointer; }
+                .erro-aviso { background:#fef2f2;border:1px solid #fca5a5;padding:12px 16px;border-radius:8px;margin-bottom:20px;color:#dc2626; }
             </style>
             <script>
                 async function marcar(kitId) {
@@ -698,30 +755,33 @@ async def painel_admin_vendas():
         <body>
             <h1>📋 Fila de Separação de Kits</h1>
     """
-    
-    for v in reversed(DB_VENDAS_KITS):
+
+    if erro_supabase:
+        html_content += f'<div class="erro-aviso">⚠️ {erro_supabase}</div>'
+
+    for v in vendas:
         pedido_gratis = v.get("pedido_gratuito", False)
-        total = v.get("total_price", 0)
+        total = v.get("total_price") or 0
         status_css = "separado" if v.get("ja_foi_separado") else ""
-        check_attr = "checked" if v.get("ja_foi_separado") else ""
         enviado_css = "enviado" if v.get("enviado") else ""
         check_enviado = "checked" if v.get("enviado") else ""
-        status_pedido = v.get("status_pedido", "—")
         status_pagamento = v.get("status_pagamento", "—")
-        pedido_num = v.get("numero_pedido_shopify", "—")
-        email_cli = v.get("email_cliente", "—")
-        detalhes_html = "".join([f"<div class='item-badge'><b>{i['unidade']}:</b> {i['tamanho']} - {i['cor']}</div>" for i in v['detalhes']])
-        
+        pedido_num = v.get("numero_pedido_shopify") or "—"
+        email_cli = v.get("email_cliente") or "—"
+        data_hora = v.get("data_hora") or v.get("created_at", "—")
+        kit_id = v.get("kit_id", "")
+        detalhes = v.get("detalhes") or []
+        detalhes_html = "".join([f"<div class='item-badge'><b>{i.get('unidade','?')}:</b> {i.get('tamanho','?')} - {i.get('cor','?')}</div>" for i in detalhes])
+
         html_content += f"""
-            <div class="card {status_css} {enviado_css}" id="card-{v['kit_id']}">
+            <div class="card {status_css} {enviado_css}" id="card-{kit_id}">
                 <div class="header">
                 <div>
                     <small>
-                    {v.get('data_hora','—')} | ID: {v['kit_id']} | Pedido: {pedido_num}
+                    {data_hora} | ID: {kit_id} | Pedido: {pedido_num}
                     </small>
 
                     <div style="margin-top:6px; font-size:14px;">
-                    <b>Status pedido:</b> {status_pedido} &nbsp; | &nbsp;
                     <b>Pagamento:</b> {status_pagamento} &nbsp; | &nbsp;
                     <b>Email:</b> {email_cli}
                     </div>
@@ -729,8 +789,11 @@ async def painel_admin_vendas():
                     {"<div style='margin-top:8px; color:#6c5ce7; font-weight:600;'>💸 Pedido com custo ZERO (Cupom aplicado)</div>" if pedido_gratis else f"<div style='margin-top:8px; color:#28a745; font-weight:600;'>💰 Total: R$ {total}</div>"}
 
                     <div style="margin-top:10px;">
-                    <label style="margin-left:12px;">Enviado</label>
-                    <input type="checkbox" class="checkbox-custom" {check_enviado} onclick="marcarEnviado('{v['kit_id']}')">
+                    <input type="checkbox" class="checkbox-custom" onclick="marcar('{kit_id}')" {"checked" if v.get("ja_foi_separado") else ""}>
+                    <label>Separado</label>
+                    &nbsp;&nbsp;
+                    <input type="checkbox" class="checkbox-custom" {check_enviado} onclick="marcarEnviado('{kit_id}')">
+                    <label>Enviado</label>
                     </div>
                 </div>
                 </div>
@@ -740,7 +803,7 @@ async def painel_admin_vendas():
                 </div>
             </div>
             """
-    
+
     html_content += "</body></html>"
     return html_content
 
@@ -1778,6 +1841,93 @@ async def sincronizar_produtos_e_estoque():
         "status": "sucesso",
         "produtos_salvos": len(rows_produtos),
         "estoque_salvo": len(rows_estoque),
+    }
+
+
+@app_servidor_web.get("/admin/backfill-shopify")
+async def backfill_shopify_kit_selecoes(dias: int = 90):
+    """
+    Varre pedidos recentes da Shopify e preenche kit_selecoes com
+    numero_pedido_shopify, total_price e pedido_gratuito para registros
+    que ainda não têm esses dados (backfill de histórico).
+    """
+    if not TOKEN_SHOPIFY or not NOME_DA_LOJA_SHOPIFY:
+        raise HTTPException(status_code=503, detail="Credenciais Shopify não configuradas.")
+    if not cliente_banco_supabase:
+        raise HTTPException(status_code=503, detail="Supabase não configurado.")
+
+    headers = {"X-Shopify-Access-Token": TOKEN_SHOPIFY, "Content-Type": "application/json"}
+    data_limite = (datetime.utcnow() - timedelta(days=dias)).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    pedidos_shopify: list[dict] = []
+    url = (
+        f"https://{NOME_DA_LOJA_SHOPIFY}.myshopify.com/admin/api/2024-01/orders.json"
+        f"?status=any&limit=250&created_at_min={data_limite}&fields=id,name,landing_site,financial_status,total_price,customer,email"
+    )
+
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        while url:
+            resp = await client.get(url, headers=headers)
+            if resp.status_code != 200:
+                raise HTTPException(status_code=502, detail=f"Shopify retornou {resp.status_code}: {resp.text}")
+            pedidos_shopify.extend(resp.json().get("orders", []))
+            link = resp.headers.get("Link", "")
+            url = None
+            for part in link.split(","):
+                if 'rel="next"' in part:
+                    url = part.strip().split(";")[0].strip().strip("<>")
+                    break
+
+    logger_telemetria.info(f"[Backfill] {len(pedidos_shopify)} pedidos buscados na Shopify (últimos {dias} dias)")
+
+    atualizados = 0
+    sem_kit_id = 0
+
+    for pedido in pedidos_shopify:
+        landing_site = pedido.get("landing_site") or ""
+        kit_id = extrair_utm_campaign(landing_site)
+        if not kit_id:
+            sem_kit_id += 1
+            continue
+
+        financial_status = (pedido.get("financial_status") or "").upper()
+        total_price = _safe_float(pedido.get("total_price")) or 0.0
+        pedido_gratuito = total_price == 0
+
+        customer = pedido.get("customer") or {}
+        email = pedido.get("email") or customer.get("email")
+        nome = (
+            (customer.get("first_name") or "") + " " + (customer.get("last_name") or "")
+        ).strip() or customer.get("name")
+
+        status_pag = "GRÁTIS" if pedido_gratuito else (
+            "PAGO" if financial_status in ["PAID", "AUTHORIZED"] else "PENDENTE"
+        )
+
+        update: dict = {
+            "numero_pedido_shopify": pedido.get("name"),
+            "total_price": total_price,
+            "pedido_gratuito": pedido_gratuito,
+            "status_pagamento": status_pag,
+        }
+        if email:
+            update["email_cliente"] = email
+        if nome:
+            update["nome_cliente"] = nome
+
+        try:
+            cliente_banco_supabase.table("kit_selecoes").update(update).eq("kit_id", kit_id).execute()
+            atualizados += 1
+        except Exception as e:
+            logger_telemetria.error(f"[Backfill] Erro ao atualizar kit_id={kit_id}: {e}")
+
+    logger_telemetria.info(f"[Backfill] Concluído: {atualizados} atualizados | {sem_kit_id} sem kit_id")
+    return {
+        "status": "sucesso",
+        "pedidos_shopify": len(pedidos_shopify),
+        "atualizados": atualizados,
+        "sem_kit_id": sem_kit_id,
+        "periodo_dias": dias,
     }
 
 
